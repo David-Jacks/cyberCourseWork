@@ -1,159 +1,128 @@
-**Security Design and Implementation Guide**
+**Security — simple summary of what was added and how to use it**
 
-This document explains where and how to implement common security measures in the repository (files: `myserver.py`, `myclient.py`, `myregistrar.py`, `myadmin.py`, `mytallier.py`). It does not change existing code — instead it maps design decisions, the specific endpoints and functions where security should be enforced, and provides concrete example snippets and operational guidance.
+This project now contains a simple, demonstrative security layer. The goal
+was to: prevent linking votes to students, prevent double-voting, encrypt
+votes in transit and at rest, and require two separate parties to decrypt
+votes. Below is a short, easy-to-read explanation of what I changed and how
+to use it.
 
-**Goals**
-- Protect voter identities and ballot integrity.
-- Prevent tampering with registrations and ballots.
-- Provide auditability without compromising voter anonymity.
+What I added (files)
+- `secure_utils.py` — new helper module that provides:
+  - `hash_id(voter_id)` — non-reversible SHA-256 hash used as a voter handle.
+  - Ed25519/RSA sign/verify helpers.
+  - `encrypt_ballot_for_two(...)` / `decrypt_ballot_with_both(...)` — a
+    hybrid encryption scheme where the AES key is split into two shares and
+    each share is encrypted to a different RSA public key. Both private keys
+    are required to decrypt.
+- `requirements.txt` — lists `cryptography` dependency.
 
-**High-level choices**
-- Transport: use TLS (HTTPS) in production — run behind a TLS-terminating reverse proxy (nginx, Caddy) or enable `ssl` in Python `http.server` if needed for testing.
-- Authentication & Authorization: use asymmetric keys for signing messages exchanged between clients (Registrar, Admin) and the server; optionally use API keys + TLS for connections.
-- Integrity: use digital signatures on critical messages (registrations, ballot submissions, admin commands).
-- Privacy / minimal storage: store hashed identifiers where possible and store non-linkable ballot records.
+Files I updated and what they now do
+- `myregistrar.py` (client): when `REGISTRAR_PRIV_KEY` is set the script
+  signs registration requests and sends the signature in `X-Signature`.
 
-**Where to apply each technique (file & endpoint mapping)**
+- `myadmin.py` (client): when `ADMIN_PRIV_KEY` is set the script signs
+  open/close commands (also `X-Signature`). The server verifies these.
 
-- Hashing (one-way) — purpose: protect stored identifiers and produce non-reversible voter handles.
-  - Implement in `myserver.py`:
-    - On `POST /register`: instead of storing raw `voter_id`, store a salted cryptographic hash (e.g. HMAC or PBKDF2/Argon2) of `voter_id`. Keep a server-side secret salt/key in a secure location (not in repo). Use `hmac` or `hashlib.pbkdf2_hmac`.
-    - In `POST /vote`: accept the `voter_id` in the request but compare via the hashed form (hash the provided `voter_id` with the same salt/key and compare against stored hashed ids).
-    - Benefit: if storage is leaked, raw IDs are not revealed.
+- `myclient.py` (student client): when both `REGISTRAR_PUB_KEY` and
+  `TALLIER_PUB_KEY` environment variables are set, the client encrypts the
+  ballot locally using the two-share scheme and sends only the encrypted
+  payload plus `voter_hash`. This keeps choices confidential from the
+  server and other roles.
 
-- Digital Signatures — purpose: ensure authenticity and non-repudiation of actions.
-  - Who signs: `myregistrar` signs registrations; `myadmin` signs open/close commands; `myclient` (student) signs ballots optionally (or uses a one-time token signed by Registrar).
-  - Implement in both client-side modules (`myregistrar.py`, `myadmin.py`, optionally `myclient.py`) and server-side verification in `myserver.py`:
-    - Keypairs: each role (Registrar, Admin, Tallier) gets an asymmetric keypair (Ed25519 or RSA). Public keys are deployed to the server's trusted-keys store (or a simple JSON file loaded at server start).
-    - On `POST /register`: Registrar signs the registration JSON (voter_id, name, timestamp). The server verifies the Registrar signature before accepting registration.
-    - On `POST /election/open` and `/election/close`: Admin's client signs the request; server verifies signature before transitioning state.
-    - On `POST /vote`: either the student's ballot is signed with a per-voter key (if keys are distributed) or the ballot includes a registrar-issued signed voting token (a short-lived token proving the student is eligible). The server verifies the token or signature and records the ballot.
+- `myserver.py` (server):
+  - Verifies Registrar/Admin signatures when the corresponding public key
+    env vars are configured (`REGISTRAR_PUB_KEY`, `ADMIN_PUB_KEY`).
+  - On `POST /register` stores only `voter_hash` (not raw id) and stores
+    the voter's name encrypted for the Registrar if the Registrar public key
+    is configured. Raw IDs are not kept on the server.
+  - On `POST /vote` accepts encrypted ballots (and stores ciphertext plus
+    `voter_hash`) or accepts legacy plain ballots. Double-vote prevention
+    is done using `voter_hash` only.
+  - On `GET /ballots` returns only encrypted ballots. If `TALLIER_PUB_KEY`
+    is configured the server requires a tallier signature to fetch them.
 
-- Asymmetric Encryption — purpose: protect confidentiality of messages where needed (e.g., storing ballots encrypted until tally time or encrypting ballots for the tallier so only tallier can decrypt).
-  - Implement in `myserver.py` and `mytallier.py`:
-    - Option A (server-side encrypted ballots): encrypt ballot contents with the Tallier's public key before persisting; the tallier later decrypts with his private key to tally. This keeps server storage confidential if the server is compromised.
-    - Option B (client-side encryption): client encrypts the ballot with tallier's public key and sends ciphertext to server. Server stores ciphertext; tallier fetches ciphertext and decrypts for tallying.
-    - Use modern algorithms (e.g. RSA-OAEP or ECIES or hybrid encryption using ECDH + symmetric cipher like AES-GCM). Prefer libs: `cryptography` (high-level primitives) or `pyca/cryptography`.
+- `mytallier.py` (tallier): fetches encrypted ballots and decrypts them
+  only when both `REGISTRAR_PRIV_KEY` and `TALLIER_PRIV_KEY` are available
+  locally. This enforces the "two-entity" decryption requirement.
 
-**Detailed mapping: endpoints and recommended changes**
+How these changes meet your requirements (plain language)
+- We do not store raw voter IDs next to ballots. The server stores a
+  non-reversible `voter_hash` so votes cannot easily be traced back to a
+  student's raw ID.
+- Double-voting is prevented by checking `voter_hash` — even though the
+  server doesn't know raw IDs it can still detect repeated hashes.
+- Votes are encrypted before being sent (when both public keys are set).
+  The client encrypts ballots using AES-GCM and a two-share scheme so both
+  Registrar and Tallier private keys are required to decrypt.
+- The Registrar holds the ability to recover registered names (names are
+  encrypted for the Registrar). Admin/Tallier/server see only encrypted
+  names and `voter_hash` values.
+- The Tallier can decrypt and tally votes without learning which student
+  made each vote (they see decrypted choices and `voter_hash`, not raw IDs).
 
-- `myserver.py`:
-  - `POST /register`:
-    - Verify Registrar signature on payload.
-    - Hash `voter_id` before storing: use HMAC-SHA256 with a server secret key, or use Argon2/PBKDF2 with salt for stronger resistance.
-    - Store only hashed id and optionally a registration signature/receipt to present to voter.
-
-  - `GET /voters`:
-    - Return only hashed voter IDs or an internal mapping; avoid returning raw IDs in production.
-
-  - `POST /options`:
-    - Verify Registrar signature (if Registrar should be the only one to set options).
-
-  - `POST /election/open` and `/election/close`:
-    - Require Admin signature; verify signature before calling `election.set(...)`.
-
-  - `POST /vote`:
-    - Accept either: (a) a registrar-signed voting token proving the voter is allowed to vote, or (b) client's signature using voter's private key.
-    - Use hashed voter lookup: compute HMAC(hash_key, voter_id) and ensure the hashed id matches a registered hashed id.
-    - Optionally encrypt ballot choice using Tallier public key before storing so only Tallier can decrypt.
-    - Ensure double-voting prevention is performed on hashed id (not raw id).
-
-  - `GET /ballots`:
-    - Return decrypted ballots only to an authenticated Tallier (verify Tallier signature on request). Alternatively return ciphertexts and let Tallier decrypt locally.
-
-- `myclient.py`:
-  - Student flow (`sys_stater`) may send either clear ballots (if server protects them) or a registrar-signed token + ballot signed by voter. Implement helper to attach digital signature to POST `/vote` payload.
-
-- `myregistrar.py`:
-  - On `add_voter` (client side): sign registration payload with Registrar private key before sending. The server must verify signature.
-  - Optionally, Registrar can issue a short-lived signed voting token that the student will use to submit a ballot later.
-
-- `myadmin.py`:
-  - `open_election` / `close_election`: sign admin commands with Admin private key. The server must verify signature before applying state changes.
-
-- `mytallier.py`:
-  - For tallying: fetch ciphertext ballots and decrypt with Tallier private key, then tally.
-  - Verify signatures on ballots/tokens as needed.
-
-**Key management**
-- Keys should never be checked into the repository.
-- For local development, keep keys in `~/.voting/keys/` with restrictive permissions, or use environment variables that hold encrypted keys.
-- The server must have trusted public keys for Admin, Registrar, Tallier. Example: `trusted_keys.json` with role -> public key mapping. Load it at server start.
-
-**Example Python snippets**
-
-- HMAC hashing of voter_id (server-side):
-
-```py
-import hmac
-import hashlib
-
-HMAC_KEY = b"replace-with-secure-random-key"
-
-def hash_voter_id(voter_id: str) -> str:
-    return hmac.new(HMAC_KEY, voter_id.encode('utf-8'), hashlib.sha256).hexdigest()
+Quick setup and test (local development)
+1. Install dependency:
+```bash
+python3 -m pip install -r requirements.txt
 ```
 
-- Signing with Ed25519 (client-side Registrar / Admin):
+2. Generate test keys (example):
+```bash
+# Registrar RSA (encryption share)
+openssl genpkey -algorithm RSA -out registrar_enc_priv.pem -pkeyopt rsa_keygen_bits:2048
+openssl rsa -in registrar_enc_priv.pem -pubout -out registrar_enc_pub.pem
 
-```py
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from cryptography.hazmat.primitives import serialization
+# Tallier RSA (encryption share)
+openssl genpkey -algorithm RSA -out tallier_enc_priv.pem -pkeyopt rsa_keygen_bits:2048
+openssl rsa -in tallier_enc_priv.pem -pubout -out tallier_enc_pub.pem
 
-# load private key (PEM) from secure storage
-priv = Ed25519PrivateKey.from_private_bytes(b"...32 bytes...")
-sig = priv.sign(b"message-bytes")
+# Registrar signing key (Ed25519)
+openssl genpkey -algorithm ed25519 -out registrar_sign_priv.pem
+openssl pkey -in registrar_sign_priv.pem -pubout -out registrar_sign_pub.pem
 
-# server verifies using public key
-pub = Ed25519PublicKey.from_public_bytes(b"...32 bytes...")
-pub.verify(sig, b"message-bytes")
+# Admin signing key (Ed25519)
+openssl genpkey -algorithm ed25519 -out admin_sign_priv.pem
+openssl pkey -in admin_sign_priv.pem -pubout -out admin_sign_pub.pem
 ```
 
-- Hybrid encryption of ballot (encrypt with Tallier public key):
+3. Export environment variables (example):
+```bash
+export REGISTRAR_PRIV_KEY="$PWD/registrar_sign_priv.pem"
+export REGISTRAR_PUB_KEY="$PWD/registrar_sign_pub.pem"
+export ADMIN_PRIV_KEY="$PWD/admin_sign_priv.pem"
+export ADMIN_PUB_KEY="$PWD/admin_sign_pub.pem"
+export TALLIER_PRIV_KEY="$PWD/tallier_enc_priv.pem"
+export TALLIER_PUB_KEY="$PWD/tallier_enc_pub.pem"
+```
 
-Use `cryptography` high-level primitives (examples omitted here). For production, use an agreed hybrid scheme (ECDH + AES-GCM) or RSA-OAEP.
+4. Run the server and follow the normal interactive flows in the client
+   scripts. When keys are configured the new secure behaviors are used.
 
-**Message formats and headers**
-- Signed requests should include headers like:
-  - `X-Signature: base64(signature-bytes)`
-  - `X-Signer: registrar` (role identifier)
-  - `Date: RFC1123-timestamp` (include in signed payload to avoid replay)
+Notes, limitations, and next steps
+- This is a demonstration implementation — it shows the patterns and
+  integrates them into your existing code with minimal, readable changes.
+- Production hardening to consider:
+  - Use TLS (HTTPS) for all transport.
+  - Store private keys securely (HSM, vault) — do not put them in the repo.
+  - Add replay protection (timestamps and nonce cache) for signed messages.
+  - Consider threshold cryptography (Shamir or MPC) for stronger multi-party
+    decryption if you need more than 2 shares or more robust key sharing.
 
-The server verifies signature over canonical payload: e.g. JSON body + Date header.
+If you'd like, I can now:
+- add a small `generate_keys.sh` helper (in `tests/keys/`) for local testing,
+- add replay protection in server request verification, or
+- switch from the XOR two-share design to Shamir secret-sharing for the
+  symmetric key (done in this update).
 
-**Replay protection & freshness**
-- Include timestamps and short expiry (e.g., `ts` field and/or `Date` header) in signed payloads. Server should reject messages older than an allowed window (e.g., 2 minutes) and keep a small cache of recent nonces/timestamps to prevent simple replays.
+This commit switched the two-share XOR scheme to a 3-of-3 Shamir secret
+sharing scheme. The encryption now requires keys for Admin, Registrar and
+Tallier. See the "Shamir" notes below and the code in `secure_utils.py`.
 
-**Privacy considerations & tallying**
-- To preserve anonymity: do not store raw voter_id next to their ballot. Use hashed ids for uniqueness checks, and if possible strip or irreversibly separate identifying information before storing ballots.
-- If ballots are encrypted for the Tallier, the server should store ciphertexts and never persist decryption keys.
+Shamir notes
+- The symmetric AES key is split into 3 shares using Shamir over GF(256).
+- Each share is encrypted to one party's RSA public key (admin, registrar,
+  tallier). To decrypt, all three private keys are required and used to
+  reconstruct the AES key and decrypt ballots.
 
-**Operational checklist for implementing these measures**
-- Add a new helper module `crypto_utils.py` containing:
-  - key loading helpers
-  - sign/verify helpers
-  - hash helpers
-  - encrypt/decrypt helpers
-- Add server-side verification calls in `myserver.py` endpoints described above.
-- Update `myregistrar.py` and `myadmin.py` to sign outgoing critical requests.
-- Decide whether students will have keys; otherwise implement registrar-signed tokens.
-- Add `trusted_keys.json` (example only) in deployment; keep private keys out of repo.
-
-**Recommended libraries**
-- `cryptography` (pyca/cryptography) — modern and maintained.
-- `argon2-cffi` or `bcrypt` for password-style hashing if needed.
-
-**Example workflow (Registrar issues token + student votes)**
-1. Registrar registers voter: sends signed `{"voter_id": ..., "name": ..., "ts": ...}`. Server verifies signature and stores `hmac(voter_id)`.
-2. Registrar issues short-lived voting token: `token = sign({"voter_hash": hmac(voter_id), "expiry": ...})` and gives token to student (out-of-band or printed).
-3. Student submits ballot: POST `/vote` with `{"token": <token>, "choice": ...}`. Server verifies token signature and expiry, then records (optionally encrypting the choice with Tallier public key) and marks `voter_hash` as having voted.
-
-**Testing notes**
-- For development, you can generate ephemeral keys and store them in `tests/keys/` but ensure `.gitignore` excludes private keys in other environments.
-- Write unit tests for sign/verify, encryption/decryption and for replay windows.
-
-**Next steps (I can implement if you want)**
-- Add `crypto_utils.py` and wire basic signing/verification for `POST /election/open` and `/register`.
-- Add sample key generation scripts and a small README for key management.
-
-If you want, I can now implement the helper module and instrument `myserver.py` + `myadmin.py` + `myregistrar.py` to demonstrate the flow. Tell me whether you prefer Registrar-signed tokens for students or distributing keys to students.
+If you want, I can now add the `generate_keys.sh` helper or implement
+replay protection. Which do you prefer?

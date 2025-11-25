@@ -12,6 +12,17 @@ commands:
 
 import sys
 import requests
+import os
+import base64
+import json
+from typing import Optional
+
+# Optional cryptographic helpers. If `REGISTRAR_PRIV_KEY` points to a PEM
+# private key, registration requests will be signed and include `X-Signature`.
+try:
+    from secure_utils import sign_ed25519
+except Exception:
+    sign_ed25519 = None
 
 BASE_URL = "http://localhost:5000"
 
@@ -19,7 +30,21 @@ BASE_URL = "http://localhost:5000"
 def add_voter(voter_id, name):
     url = f"{BASE_URL}/register"
     payload = {"voter_id": voter_id, "name": name}
-    resp = requests.post(url, json=payload, timeout=5)
+    # If a Registrar private key is configured, sign the registration payload
+    # and include the signature in headers. The server will verify it if it
+    # has the corresponding public key.
+    headers = {}
+    keypath = os.environ.get("REGISTRAR_PRIV_KEY")
+    payload_bytes = json.dumps(payload).encode("utf-8")
+    if keypath and sign_ed25519 is not None:
+        try:
+            sig = sign_ed25519(keypath, payload_bytes)
+            headers["X-Signature"] = base64.b64encode(sig).decode("ascii")
+            headers["X-Signer"] = "registrar"
+        except Exception as e:
+            print("warning: failed to sign registration payload:", e)
+
+    resp = requests.post(url, json=payload, timeout=5, headers=headers)
     resp.raise_for_status()
     print("registered:", resp.json() if resp.content else resp.text)
 

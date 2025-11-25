@@ -4,6 +4,12 @@ import requests
 import myregistrar
 import myadmin
 import mytallier
+import os
+try:
+    from secure_utils import hash_id, encrypt_ballot_for_two
+except Exception:
+    hash_id = None
+    encrypt_ballot_for_two = None
 
 #!/usr/bin/env python3
 """
@@ -69,6 +75,31 @@ def get_options(timeout: float = 5.0):
 
 def submit_ballot(voter_id: str, choice: str, timeout: float = 5.0):
     """Submit a ballot. Returns (status_code, text) or raises requests.RequestException."""
+    # Prefer encrypting ballots client-side when Registrar and Tallier public
+    # keys are configured. The encrypted payload requires both Registrar and
+    # Tallier private keys to decrypt (see secure_utils).
+    reg_pub = os.environ.get("REGISTRAR_PUB_KEY")
+    tall_pub = os.environ.get("TALLIER_PUB_KEY")
+
+    # require all three public keys (admin, registrar, tallier) for Shamir scheme
+    admin_pub = os.environ.get("ADMIN_PUB_KEY")
+    if admin_pub and reg_pub and tall_pub and hash_id is not None:
+        try:
+            from secure_utils import encrypt_ballot_shamir
+        except Exception:
+            encrypt_ballot_shamir = None
+
+        if encrypt_ballot_shamir is not None:
+            voter_hash = hash_id(voter_id)
+            ballot = {"voter_hash": voter_hash, "choice": choice}
+            plaintext = json.dumps(ballot).encode("utf-8")
+            enc = encrypt_ballot_shamir(admin_pub, reg_pub, tall_pub, plaintext)
+            payload = {"encrypted": enc, "voter_hash": voter_hash}
+            resp = requests.post(DEFAULT_HOST + "/vote", json=payload, timeout=timeout)
+            return resp.status_code, resp.text
+
+    # Fallback: send unhashed voter_id (existing behaviour) - servers may
+    # expect this for deployments that haven't configured keys.
     resp = requests.post(DEFAULT_HOST + "/vote", json={"voter_id": voter_id, "choice": choice}, timeout=timeout)
     return resp.status_code, resp.text
 

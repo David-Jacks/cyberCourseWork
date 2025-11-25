@@ -1,6 +1,17 @@
 import sys
 import requests
 from typing import Optional
+import os
+import base64
+import json
+
+# Optional signing helper (Ed25519). If `ADMIN_PRIV_KEY` env var is set and
+# a key is available, admin commands will be signed and the signature sent
+# in `X-Signature` header so the server can verify the admin request.
+try:
+    from secure_utils import sign_ed25519
+except Exception:
+    sign_ed25519 = None
 
 #!/usr/bin/env python3
 """
@@ -50,8 +61,21 @@ def open_election(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
     Returns: parsed JSON response on success, None on failure.
     """
     url = f"{BASE_URL}/election/open"
+    # Sign the command if an admin key is configured; the server will verify
+    # the signature if it has the corresponding public key configured.
+    headers = {}
+    keypath = os.environ.get("ADMIN_PRIV_KEY")
+    body = b""  # no body for this endpoint in current design
+    if keypath and sign_ed25519 is not None:
+        try:
+            sig = sign_ed25519(keypath, body)
+            headers["X-Signature"] = base64.b64encode(sig).decode("ascii")
+            headers["X-Signer"] = "admin"
+        except Exception as e:
+            print("warning: admin signing failed:", e)
+
     try:
-        resp = requests.post(url, timeout=timeout)
+        resp = requests.post(url, timeout=timeout, headers=headers)
         resp.raise_for_status()
         return _parse_response(resp)
     except Exception as e:
@@ -70,8 +94,19 @@ def close_election(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
     Returns: parsed JSON response on success, None on failure.
     """
     url = f"{BASE_URL}/election/close"
+    headers = {}
+    keypath = os.environ.get("ADMIN_PRIV_KEY")
+    body = b""
+    if keypath and sign_ed25519 is not None:
+        try:
+            sig = sign_ed25519(keypath, body)
+            headers["X-Signature"] = base64.b64encode(sig).decode("ascii")
+            headers["X-Signer"] = "admin"
+        except Exception as e:
+            print("warning: admin signing failed:", e)
+
     try:
-        resp = requests.post(url, timeout=timeout)
+        resp = requests.post(url, timeout=timeout, headers=headers)
         resp.raise_for_status()
         return _parse_response(resp)
     except Exception as e:

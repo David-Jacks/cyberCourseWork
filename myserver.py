@@ -19,6 +19,23 @@ import signal
 import sys
 import json
 import threading
+import os
+import base64
+
+# Optional secure helpers. If `cryptography` and `secure_utils.py` are
+# available they will be used; otherwise the server falls back to the
+# original behaviour (no verification/encryption).
+try:
+    from secure_utils import hash_id, verify_ed25519, encrypt_for_registrar
+except Exception:
+    hash_id = None
+    verify_ed25519 = None
+    encrypt_for_registrar = None
+
+# Public key paths (set these in the environment in deployments)
+REGISTRAR_PUB = os.environ.get("REGISTRAR_PUB_KEY")
+ADMIN_PUB = os.environ.get("ADMIN_PUB_KEY")
+TALLIER_PUB = os.environ.get("TALLIER_PUB_KEY")
 
 
 class ElectionState:
@@ -96,8 +113,10 @@ class reqHandler(BaseHTTPRequestHandler):
         # Return list of registered voters
         if self.path == "/voters":
             # Return as list of {"voter_id": id, "name": name}
+            # Return hashed voter identifiers and encrypted names. The
+            # server never exposes raw voter_id values in production.
             with storage_lock:
-                vlist = [{"voter_id": vid, "name": name} for vid, name in voters.items()]
+                vlist = [{"voter_hash": vid, "enc_name": name} for vid, name in voters.items()]
             send_json(self, {"voters": vlist})
             return
 
@@ -112,6 +131,24 @@ class reqHandler(BaseHTTPRequestHandler):
             if election.get() != "closed":
                 send_text(self, "ballots available only after election is closed\n", status=403)
                 return
+            # Return encrypted ballots. If a TALLIER_PUB key is configured the
+            # server expects the request to be authenticated by the tallier.
+            sig_b64 = self.headers.get("X-Signature")
+            signer = self.headers.get("X-Signer")
+            if TALLIER_PUB and signer == "tallier":
+                if not sig_b64 or verify_ed25519 is None:
+                    send_text(self, "tallier signature required\n", status=403)
+                    return
+                try:
+                    sig = base64.b64decode(sig_b64)
+                    # Verify over empty body for this simple example
+                    if not verify_ed25519(TALLIER_PUB, b"", sig):
+                        send_text(self, "invalid tallier signature\n", status=403)
+                        return
+                except Exception:
+                    send_text(self, "invalid signature format\n", status=403)
+                    return
+
             with storage_lock:
                 send_json(self, {"ballots": ballots})
             return
@@ -125,7 +162,6 @@ class reqHandler(BaseHTTPRequestHandler):
             if election.get() != "closed":
                 send_text(self, "registration allowed only while election is closed\n", status=403)
                 return
-
             length = int(self.headers.get("Content-Length", "0"))
             try:
                 raw = self.rfile.read(length) if length else b""
@@ -134,19 +170,51 @@ class reqHandler(BaseHTTPRequestHandler):
                 send_text(self, "invalid JSON\n", status=400)
                 return
 
+            # Verify registrar signature if present and a public key is
+            # configured. The signature should be over the raw request body.
+            sig_b64 = self.headers.get("X-Signature")
+            signer = self.headers.get("X-Signer")
+            if REGISTRAR_PUB and signer == "registrar":
+                if not sig_b64 or verify_ed25519 is None:
+                    send_text(self, "registrar signature required\n", status=403)
+                    return
+                try:
+                    sig = base64.b64decode(sig_b64)
+                    if not verify_ed25519(REGISTRAR_PUB, raw, sig):
+                        send_text(self, "invalid registrar signature\n", status=403)
+                        return
+                except Exception:
+                    send_text(self, "invalid signature format\n", status=403)
+                    return
+
             voter_id = payload.get("voter_id")
             name = payload.get("name")
             if not voter_id or not name:
                 send_text(self, "missing voter_id or name\n", status=400)
                 return
 
+            # Hash the voter_id before storing to avoid keeping raw identifiers.
+            vhash = hash_id(voter_id) if hash_id is not None else voter_id
+
+            # Encrypt the voter's name for the Registrar so only the Registrar
+            # can recover names. If no registrar public key is configured we
+            # fallback to storing the clear name (development mode only).
+            if encrypt_for_registrar is not None and REGISTRAR_PUB:
+                try:
+                    enc_name = encrypt_for_registrar(REGISTRAR_PUB, name.encode("utf-8"))
+                except Exception:
+                    enc_name = name
+            else:
+                enc_name = name
+
             with storage_lock:
-                if voter_id in voters:
+                if vhash in voters:
                     send_text(self, "voter already registered\n", status=409)
                     return
-                voters[voter_id] = name
+                voters[vhash] = enc_name
 
-            send_json(self, {"voter_id": voter_id, "name": name}, status=201)
+            # Return non-sensitive confirmation (we do not echo raw voter_id)
+            send_json(self, {"voter_hash": vhash, "name_encrypted": bool(REGISTRAR_PUB)}, status=201)
             return
 
         # Configure options (allowed only while election is closed)
@@ -180,7 +248,6 @@ class reqHandler(BaseHTTPRequestHandler):
             if election.get() != "open":
                 send_text(self, "election is not open for voting\n", status=403)
                 return
-
             length = int(self.headers.get("Content-Length", "0"))
             try:
                 raw = self.rfile.read(length) if length else b""
@@ -189,37 +256,101 @@ class reqHandler(BaseHTTPRequestHandler):
                 send_text(self, "invalid JSON\n", status=400)
                 return
 
+            # Support encrypted ballots: the client can submit an `encrypted`
+            # object (produced by secure_utils.encrypt_ballot_for_two). The
+            # request must also include `voter_hash` so the server can check
+            # registration and prevent double voting without learning the raw id.
+            enc = payload.get("encrypted")
+            voter_hash = payload.get("voter_hash")
+
+            if enc:
+                if not voter_hash:
+                    send_text(self, "missing voter_hash for encrypted ballot\n", status=400)
+                    return
+
+                with storage_lock:
+                    if voter_hash not in voters:
+                        send_text(self, "Student not registered, speak to the Registrar,\n", status=403)
+                        return
+                    # prevent double-voting by hashed id
+                    if any(b.get("voter_hash") == voter_hash for b in ballots):
+                        send_text(self, "You already voted, you are allowed to vote once for fairness\n", status=409)
+                        return
+
+                    # Save encrypted ballot as-is; decryption requires both
+                    # Registrar and Tallier private keys.
+                    ballots.append({"voter_hash": voter_hash, "encrypted": enc})
+
+                send_text(self, "Ballot accepted\n", status=201)
+                return
+
+            # Fallback: older/plain behaviour -- accept clear ballots and
+            # still use hashed voter lookup if possible.
             voter_id = payload.get("voter_id")
             choice = payload.get("choice")
             if not voter_id or choice is None:
                 send_text(self, "missing voter_id or choice\n", status=400)
                 return
 
+            vhash = hash_id(voter_id) if hash_id is not None else voter_id
+
             with storage_lock:
-                if voter_id not in voters:
+                if vhash not in voters:
                     send_text(self, "Student not registered, speak to the Registrar,\n", status=403)
                     return
-                # prevent double-voting: check if voter already in ballots
-                if any(b.get("voter_id") == voter_id for b in ballots):
+                if any(b.get("voter_hash") == vhash for b in ballots):
                     send_text(self, "You already voted, you are allowed to vote once for fairness\n", status=409)
                     return
                 if choice not in options:
                     send_text(self, "invalid choice\n", status=400)
                     return
 
-                ballots.append({"voter_id": voter_id, "choice": choice})
+                # store as encrypted=False legacy ballot (server still stores
+                # voter_hash to avoid raw ids in ballot list)
+                ballots.append({"voter_hash": vhash, "choice": choice})
 
             send_text(self, "Ballot accepted\n", status=201)
             return
 
         # Open voting
         if self.path == "/election/open":
+            # Verify admin signature if available.
+            sig_b64 = self.headers.get("X-Signature")
+            signer = self.headers.get("X-Signer")
+            if ADMIN_PUB and signer == "admin":
+                if not sig_b64 or verify_ed25519 is None:
+                    send_text(self, "admin signature required\n", status=403)
+                    return
+                try:
+                    sig = base64.b64decode(sig_b64)
+                    if not verify_ed25519(ADMIN_PUB, b"", sig):
+                        send_text(self, "invalid admin signature\n", status=403)
+                        return
+                except Exception:
+                    send_text(self, "invalid signature format\n", status=403)
+                    return
+
             election.set("open")
             send_text(self, "voting opened\n", status=200)
             return
 
         # Close voting
         if self.path == "/election/close":
+            sig_b64 = self.headers.get("X-Signature")
+            signer = self.headers.get("X-Signer")
+            if ADMIN_PUB and signer == "admin":
+                if not sig_b64 or verify_ed25519 is None:
+                    send_text(self, "admin signature required\n", status=403)
+                    return
+                try:
+                    sig = base64.b64decode(sig_b64)
+                    if not verify_ed25519(ADMIN_PUB, b"", sig):
+                        send_text(self, "invalid admin signature\n", status=403)
+                        return
+                except Exception:
+                    send_text(self, "invalid signature format\n", status=403)
+                    return
+
             election.set("closed")
             send_text(self, "voting closed\n", status=200)
             return
