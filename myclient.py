@@ -5,11 +5,7 @@ import myregistrar
 import myadmin
 import mytallier
 import os
-try:
-    from secure_utils import hash_id, encrypt_ballot_for_two
-except Exception:
-    hash_id = None
-    encrypt_ballot_for_two = None
+from secure_utils import hash_id, encrypt_ballot_for_two
 
 #!/usr/bin/env python3
 """
