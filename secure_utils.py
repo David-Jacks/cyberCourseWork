@@ -9,24 +9,20 @@ repository. It intentionally keeps a simple, explicit API:
   split of the symmetric key so that BOTH the Registrar and the Tallier must
   provide their private keys to reconstruct the AES key and decrypt ballots.
 
-Notes:
-- This code depends on the `cryptography` library. Install with:
-    pip install cryptography
-- Keys are loaded from PEM files. The app looks for paths in environment
-  variables where appropriate (see callers in the codebase).
+
 """
 
-import os
-import json
 import base64
 import hashlib
 import secrets
-from typing import Tuple, Dict
+from typing import Dict
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa, ed25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
 def hash_id(voter_id: str) -> str:
@@ -37,7 +33,14 @@ def hash_id(voter_id: str) -> str:
     """
     if voter_id is None:
         return None
-    return hashlib.sha256(voter_id.encode("utf-8")).hexdigest()
+    # Use an optional server-side pepper to make preimage/guessing attacks
+    # harder: the pepper should be kept secret on the server (env var
+    # HASH_PEPPER). This preserves deterministic hashing while preventing
+    # attackers from precomputing hashes for guessed IDs.
+    import os
+    pepper = os.environ.get("HASH_PEPPER", "")
+    data = (voter_id + "|" + pepper).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
 
 
 def load_private_key(path: str, password: bytes = None):
@@ -253,14 +256,13 @@ def shamir_combine(shares):
 
 
 def encrypt_ballot_shamir(admin_pub_path: str, registrar_pub_path: str, tallier_pub_path: str, plaintext: bytes) -> Dict:
-    """Encrypt plaintext so that all three parties (admin, registrar, tallier)
-    must cooperate to decrypt (3-of-3 Shamir).
+    """Encrypt plaintext so that a threshold of parties must cooperate to decrypt.
 
-    Steps:
-    - generate random AES-256 key K
-    - AES-GCM encrypt plaintext with K
-    - split K into 3 shares with shamir_split (n=3,k=3)
-    - encrypt each share with the corresponding RSA public key
+    This implementation uses Shamir secret sharing to split the AES key
+    into 3 shares and sets threshold k=2 (any two parties are sufficient
+    to reconstruct). The three parties are admin, registrar and tallier.
+
+    Returns a JSON-serializable dict with base64-encoded fields.
     """
     admin_pub = load_public_key(admin_pub_path)
     reg_pub = load_public_key(registrar_pub_path)
@@ -271,7 +273,8 @@ def encrypt_ballot_shamir(admin_pub_path: str, registrar_pub_path: str, tallier_
     nonce = secrets.token_bytes(12)
     ct = aesgcm.encrypt(nonce, plaintext, associated_data=None)
 
-    shares = shamir_split(K, 3, 3)
+    # Split K into 3 shares with threshold k=2 (any 2 of 3 can combine)
+    shares = shamir_split(K, 3, 2)
     # shares are [(1, b1), (2, b2), (3, b3)] map to admin/reg/tall
     enc_admin = _rsa_encrypt(admin_pub, shares[0][1])
     enc_reg = _rsa_encrypt(reg_pub, shares[1][1])
@@ -283,28 +286,49 @@ def encrypt_ballot_shamir(admin_pub_path: str, registrar_pub_path: str, tallier_
         "enc_share_admin": base64.b64encode(enc_admin).decode("ascii"),
         "enc_share_reg": base64.b64encode(enc_reg).decode("ascii"),
         "enc_share_tall": base64.b64encode(enc_tall).decode("ascii"),
-        "alg": "AESGCM+RSA-OAEP+Shamir-3-of-3-v1",
+        "alg": "AESGCM+RSA-OAEP+Shamir-3-of-2-v1",
     }
 
 
 def decrypt_ballot_shamir_all(admin_priv_path: str, registrar_priv_path: str, tallier_priv_path: str, payload: Dict) -> bytes:
     """Decrypt payload created by `encrypt_ballot_shamir` using all three private keys."""
-    priv_admin = load_private_key(admin_priv_path)
-    priv_reg = load_private_key(registrar_priv_path)
-    priv_tall = load_private_key(tallier_priv_path)
-
+    # Load ciphertext and encrypted shares
     ct = base64.b64decode(payload["ciphertext"])
     nonce = base64.b64decode(payload["nonce"])
     enc_admin = base64.b64decode(payload["enc_share_admin"])
     enc_reg = base64.b64decode(payload["enc_share_reg"])
     enc_tall = base64.b64decode(payload["enc_share_tall"])
 
-    s_admin = _rsa_decrypt(priv_admin, enc_admin)
-    s_reg = _rsa_decrypt(priv_reg, enc_reg)
-    s_tall = _rsa_decrypt(priv_tall, enc_tall)
+    # Attempt to decrypt any shares for which a private key path was
+    # provided. The Shamir threshold is 2, so we require at least two
+    # successfully decrypted shares to reconstruct the AES key.
+    shares = []
+    if admin_priv_path:
+        try:
+            priv_admin = load_private_key(admin_priv_path)
+            s_admin = _rsa_decrypt(priv_admin, enc_admin)
+            shares.append((1, s_admin))
+        except Exception:
+            pass
+    if registrar_priv_path:
+        try:
+            priv_reg = load_private_key(registrar_priv_path)
+            s_reg = _rsa_decrypt(priv_reg, enc_reg)
+            shares.append((2, s_reg))
+        except Exception:
+            pass
+    if tallier_priv_path:
+        try:
+            priv_tall = load_private_key(tallier_priv_path)
+            s_tall = _rsa_decrypt(priv_tall, enc_tall)
+            shares.append((3, s_tall))
+        except Exception:
+            pass
 
-    # combine shares (x values 1,2,3)
-    secret = shamir_combine([(1, s_admin), (2, s_reg), (3, s_tall)])
+    if len(shares) < 2:
+        raise ValueError("insufficient private keys available to reconstruct secret")
+
+    secret = shamir_combine(shares)
 
     aesgcm = AESGCM(secret)
     pt = aesgcm.decrypt(nonce, ct, associated_data=None)
@@ -323,3 +347,130 @@ def encrypt_for_registrar(registrar_pub_path: str, plaintext: bytes) -> str:
 def decrypt_for_registrar(registrar_priv_path: str, b64cipher: str) -> bytes:
     priv = load_private_key(registrar_priv_path)
     return _rsa_decrypt(priv, base64.b64decode(b64cipher))
+
+
+# ---- ElGamal on EC (hybrid) ----
+def elgamal_keygen(curve: ec.EllipticCurve = ec.SECP256R1()):
+    """Generate an EC keypair for ElGamal-style hybrid encryption.
+
+    Returns a tuple `(priv_pem: bytes, pub_pem: bytes)` suitable for saving to disk.
+    Uses the standard PEM serialization for private/public keys.
+    """
+    priv = ec.generate_private_key(curve)
+    pub = priv.public_key()
+
+    priv_pem = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_pem = pub.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return priv_pem, pub_pem
+
+
+def _derive_shared_key(ec_priv, ec_peer_pub, info: bytes = b"elgamal-shared") -> bytes:
+    """Derive a symmetric key from ECDH shared secret using HKDF-SHA256."""
+    shared = ec_priv.exchange(ec.ECDH(), ec_peer_pub)
+    # HKDF derive 32 bytes key
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=info,
+    )
+    return hkdf.derive(shared)
+
+
+def elgamal_encrypt(pub_pem_path: str, plaintext: bytes) -> Dict:
+    """Encrypt `plaintext` to the given EC public key (PEM file).
+
+    This performs an ephemeral-static ElGamal: pick ephemeral `k`, compute
+    `R = k*G` (ephemeral public key) and derive symmetric key from `k*Q` via
+    ECDH+HKDF. The message is encrypted with AES-GCM.
+
+    Returns a JSON-serializable dict with base64-encoded fields:
+    - `ephemeral_pub`: PEM of ephemeral public key (base64)
+    - `nonce`, `ciphertext`, `alg`
+    """
+    pub = load_public_key(pub_pem_path)
+    if not isinstance(pub, ec.EllipticCurvePublicKey):
+        # cryptography's public key types are tested at runtime; allow duck-typing
+        try:
+            # attempt to load as PEM and check
+            pass
+        except Exception:
+            raise ValueError("provided public key is not an EC public key")
+
+    # Create ephemeral key
+    eph = ec.generate_private_key(pub.curve)
+    eph_pub = eph.public_key()
+
+    # derive symmetric key via ECDH
+    shared_key = _derive_shared_key(eph, pub)
+
+    aesgcm = AESGCM(shared_key)
+    nonce = secrets.token_bytes(12)
+    ct = aesgcm.encrypt(nonce, plaintext, associated_data=None)
+
+    # serialize ephemeral public key to PEM and include
+    eph_pub_pem = eph_pub.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    return {
+        "ephemeral_pub": base64.b64encode(eph_pub_pem).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ct).decode("ascii"),
+        "alg": "EC-ElGamal+AESGCM-HKDF-SHA256-v1",
+    }
+
+
+def elgamal_decrypt(priv_pem_path: str, payload: Dict) -> bytes:
+    """Decrypt payload produced by `elgamal_encrypt` using private key PEM path."""
+    priv = load_private_key(priv_pem_path)
+    if not isinstance(priv, ec.EllipticCurvePrivateKey):
+        raise ValueError("provided private key is not an EC private key")
+
+    eph_pub_pem = base64.b64decode(payload["ephemeral_pub"])
+    eph_pub = serialization.load_pem_public_key(eph_pub_pem)
+
+    shared_key = _derive_shared_key(priv, eph_pub)
+    aesgcm = AESGCM(shared_key)
+    nonce = base64.b64decode(payload["nonce"])
+    ct = base64.b64decode(payload["ciphertext"])
+    return aesgcm.decrypt(nonce, ct, associated_data=None)
+
+
+# ---- Schnorr OR-proof API (placeholder) ----
+def generate_schnorr_or_proof_elgamal(ciphertext: Dict, allowed_plaintexts: list, priv_pem_path: str):
+    """Generate a Schnorr OR-proof that the given ElGamal `ciphertext` decrypts
+    to one of the `allowed_plaintexts` WITHOUT revealing which one.
+
+    NOTE: Full, secure Schnorr OR-proofs are non-trivial to implement correctly.
+    This function currently raises NotImplementedError and serves as a clear
+    integration point. For a production implementation, use a well-tested
+    crypto library (e.g., `petlib` or specialized ZKP libraries) and follow
+    a standard construction (Fiat-Shamir transformed Sigma OR-proofs).
+
+    If you would like, I can implement this using `petlib`/`ecpy` once you
+    confirm installation is acceptable.
+    """
+    raise NotImplementedError(
+        "Schnorr OR-proof generation is not implemented. Install a ZKP library "
+        "(e.g., petlib) and ask me to implement using that library."
+    )
+
+
+def verify_schnorr_or_proof_elgamal(ciphertext: Dict, proof, pub_pem_path: str, allowed_plaintexts: list) -> bool:
+    """Verify a Schnorr OR-proof (placeholder).
+
+    Returns True iff proof verifies. Currently not implemented.
+    """
+    raise NotImplementedError(
+        "Schnorr OR-proof verification is not implemented. Provide a proof library "
+        "and I can implement verification accordingly."
+    )

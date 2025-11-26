@@ -22,6 +22,49 @@ import threading
 import os
 import base64
 
+
+def _maybe_load_keys_env():
+    # Load dotenv keys file if present so callers can rely on os.environ.
+    env_path = os.path.join(os.path.dirname(__file__), "keys", "keys.env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_path)
+        return
+    except Exception:
+        pass
+    # Fallback simple parser (KEY=VALUE lines)
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k.strip(), v)
+    except Exception:
+        pass
+
+
+_maybe_load_keys_env()
+
+# Runtime configuration: student ID regex and admin secret
+# - `STUDENT_ID_REGEX` can be set in environment to enforce allowed ID pattern
+#   and make guessing attacks harder. Default is one example format.
+STUDENT_ID_REGEX = os.environ.get("STUDENT_ID_REGEX", r"^[A-Z]{2}[0-9]{6}$")
+import re
+_ID_PATTERN = re.compile(STUDENT_ID_REGEX)
+
+# Optional admin pre-shared secret (if set on the server, admin clients must
+# provide the same secret via the `X-Admin-Secret` header). This is separate
+# from the admin signing key and provides an additional authentication factor
+# for critical operations (open/close).
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
+
 # Optional secure helpers. If `cryptography` and `secure_utils.py` are
 # available they will be used; otherwise the server falls back to the
 # original behaviour (no verification/encryption).
@@ -32,10 +75,13 @@ except Exception:
     verify_ed25519 = None
     encrypt_for_registrar = None
 
-# Public key paths (set these in the environment in deployments)
-REGISTRAR_PUB = os.environ.get("REGISTRAR_PUB_KEY")
-ADMIN_PUB = os.environ.get("ADMIN_PUB_KEY")
-TALLIER_PUB = os.environ.get("TALLIER_PUB_KEY")
+# Public key paths (signing vs encryption). Prefer explicit SIGN/ENC vars; fall back to legacy names.
+REGISTRAR_SIGN_PUB = os.environ.get("REGISTRAR_SIGN_PUB_KEY") or os.environ.get("REGISTRAR_PUB_KEY")
+REGISTRAR_ENC_PUB = os.environ.get("REGISTRAR_ENC_PUB_KEY") or os.environ.get("REGISTRAR_PUB_KEY")
+ADMIN_SIGN_PUB = os.environ.get("ADMIN_SIGN_PUB_KEY") or os.environ.get("ADMIN_PUB_KEY")
+ADMIN_ENC_PUB = os.environ.get("ADMIN_ENC_PUB_KEY") or os.environ.get("ADMIN_PUB_KEY")
+TALLIER_SIGN_PUB = os.environ.get("TALLIER_SIGN_PUB_KEY") or os.environ.get("TALLIER_PUB_KEY")
+TALLIER_ENC_PUB = os.environ.get("TALLIER_ENC_PUB_KEY") or os.environ.get("TALLIER_PUB_KEY")
 
 
 class ElectionState:
@@ -135,14 +181,14 @@ class reqHandler(BaseHTTPRequestHandler):
             # server expects the request to be authenticated by the tallier.
             sig_b64 = self.headers.get("X-Signature")
             signer = self.headers.get("X-Signer")
-            if TALLIER_PUB and signer == "tallier":
+            if TALLIER_SIGN_PUB and signer == "tallier":
                 if not sig_b64 or verify_ed25519 is None:
                     send_text(self, "tallier signature required\n", status=403)
                     return
                 try:
                     sig = base64.b64decode(sig_b64)
                     # Verify over empty body for this simple example
-                    if not verify_ed25519(TALLIER_PUB, b"", sig):
+                    if not verify_ed25519(TALLIER_SIGN_PUB, b"", sig):
                         send_text(self, "invalid tallier signature\n", status=403)
                         return
                 except Exception:
@@ -174,13 +220,13 @@ class reqHandler(BaseHTTPRequestHandler):
             # configured. The signature should be over the raw request body.
             sig_b64 = self.headers.get("X-Signature")
             signer = self.headers.get("X-Signer")
-            if REGISTRAR_PUB and signer == "registrar":
+            if REGISTRAR_SIGN_PUB and signer == "registrar":
                 if not sig_b64 or verify_ed25519 is None:
                     send_text(self, "registrar signature required\n", status=403)
                     return
                 try:
                     sig = base64.b64decode(sig_b64)
-                    if not verify_ed25519(REGISTRAR_PUB, raw, sig):
+                    if not verify_ed25519(REGISTRAR_SIGN_PUB, raw, sig):
                         send_text(self, "invalid registrar signature\n", status=403)
                         return
                 except Exception:
@@ -193,15 +239,20 @@ class reqHandler(BaseHTTPRequestHandler):
                 send_text(self, "missing voter_id or name\n", status=400)
                 return
 
+            # Validate voter_id format to prevent guessing attacks.
+            if not _ID_PATTERN.match(str(voter_id)):
+                send_text(self, "invalid voter_id format\n", status=400)
+                return
+
             # Hash the voter_id before storing to avoid keeping raw identifiers.
             vhash = hash_id(voter_id) if hash_id is not None else voter_id
 
             # Encrypt the voter's name for the Registrar so only the Registrar
             # can recover names. If no registrar public key is configured we
             # fallback to storing the clear name (development mode only).
-            if encrypt_for_registrar is not None and REGISTRAR_PUB:
+            if encrypt_for_registrar is not None and REGISTRAR_ENC_PUB:
                 try:
-                    enc_name = encrypt_for_registrar(REGISTRAR_PUB, name.encode("utf-8"))
+                    enc_name = encrypt_for_registrar(REGISTRAR_ENC_PUB, name.encode("utf-8"))
                 except Exception:
                     enc_name = name
             else:
@@ -214,7 +265,7 @@ class reqHandler(BaseHTTPRequestHandler):
                 voters[vhash] = enc_name
 
             # Return non-sensitive confirmation (we do not echo raw voter_id)
-            send_json(self, {"voter_hash": vhash, "name_encrypted": bool(REGISTRAR_PUB)}, status=201)
+            send_json(self, {"voter_hash": vhash, "name_encrypted": bool(REGISTRAR_ENC_PUB)}, status=201)
             return
 
         # Configure options (allowed only while election is closed)
@@ -292,6 +343,11 @@ class reqHandler(BaseHTTPRequestHandler):
                 send_text(self, "missing voter_id or choice\n", status=400)
                 return
 
+            # Validate ID format on votes as well
+            if not _ID_PATTERN.match(str(voter_id)):
+                send_text(self, "invalid voter_id format\n", status=400)
+                return
+
             vhash = hash_id(voter_id) if hash_id is not None else voter_id
 
             with storage_lock:
@@ -317,13 +373,22 @@ class reqHandler(BaseHTTPRequestHandler):
             # Verify admin signature if available.
             sig_b64 = self.headers.get("X-Signature")
             signer = self.headers.get("X-Signer")
-            if ADMIN_PUB and signer == "admin":
+            # Optional admin secret check (additional factor). If ADMIN_SECRET
+            # is configured on the server then the client must also send this
+            # secret in the `X-Admin-Secret` header.
+            if ADMIN_SECRET:
+                provided = self.headers.get("X-Admin-Secret")
+                if not provided or provided != ADMIN_SECRET:
+                    send_text(self, "admin secret required\n", status=403)
+                    return
+
+            if ADMIN_SIGN_PUB and signer == "admin":
                 if not sig_b64 or verify_ed25519 is None:
                     send_text(self, "admin signature required\n", status=403)
                     return
                 try:
                     sig = base64.b64decode(sig_b64)
-                    if not verify_ed25519(ADMIN_PUB, b"", sig):
+                    if not verify_ed25519(ADMIN_SIGN_PUB, b"", sig):
                         send_text(self, "invalid admin signature\n", status=403)
                         return
                 except Exception:
@@ -338,13 +403,13 @@ class reqHandler(BaseHTTPRequestHandler):
         if self.path == "/election/close":
             sig_b64 = self.headers.get("X-Signature")
             signer = self.headers.get("X-Signer")
-            if ADMIN_PUB and signer == "admin":
+            if ADMIN_SIGN_PUB and signer == "admin":
                 if not sig_b64 or verify_ed25519 is None:
                     send_text(self, "admin signature required\n", status=403)
                     return
                 try:
                     sig = base64.b64decode(sig_b64)
-                    if not verify_ed25519(ADMIN_PUB, b"", sig):
+                    if not verify_ed25519(ADMIN_SIGN_PUB, b"", sig):
                         send_text(self, "invalid admin signature\n", status=403)
                         return
                 except Exception:

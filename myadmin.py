@@ -5,6 +5,34 @@ import os
 import base64
 import json
 
+
+def _maybe_load_keys_env():
+    env_path = os.path.join(os.path.dirname(__file__), "keys", "keys.env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_path)
+        return
+    except Exception:
+        pass
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k.strip(), v)
+    except Exception:
+        pass
+
+
+_maybe_load_keys_env()
+
 # Optional signing helper (Ed25519). If `ADMIN_PRIV_KEY` env var is set and
 # a key is available, admin commands will be signed and the signature sent
 # in `X-Signature` header so the server can verify the admin request.
@@ -64,7 +92,8 @@ def open_election(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
     # Sign the command if an admin key is configured; the server will verify
     # the signature if it has the corresponding public key configured.
     headers = {}
-    keypath = os.environ.get("ADMIN_PRIV_KEY")
+    # Prefer explicit admin signing key
+    keypath = os.environ.get("ADMIN_SIGN_PRIV_KEY") or os.environ.get("ADMIN_PRIV_KEY") or os.environ.get("ADMIN_ENC_PRIV_KEY")
     body = b""  # no body for this endpoint in current design
     if keypath and sign_ed25519 is not None:
         try:
@@ -73,6 +102,11 @@ def open_election(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
             headers["X-Signer"] = "admin"
         except Exception as e:
             print("warning: admin signing failed:", e)
+
+    # If an admin secret is configured, include it in the request headers
+    admin_secret = os.environ.get("ADMIN_SECRET")
+    if admin_secret:
+        headers["X-Admin-Secret"] = admin_secret
 
     try:
         resp = requests.post(url, timeout=timeout, headers=headers)
@@ -95,7 +129,7 @@ def close_election(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
     """
     url = f"{BASE_URL}/election/close"
     headers = {}
-    keypath = os.environ.get("ADMIN_PRIV_KEY")
+    keypath = os.environ.get("ADMIN_SIGN_PRIV_KEY") or os.environ.get("ADMIN_PRIV_KEY") or os.environ.get("ADMIN_ENC_PRIV_KEY")
     body = b""
     if keypath and sign_ed25519 is not None:
         try:
@@ -104,6 +138,10 @@ def close_election(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
             headers["X-Signer"] = "admin"
         except Exception as e:
             print("warning: admin signing failed:", e)
+
+    admin_secret = os.environ.get("ADMIN_SECRET")
+    if admin_secret:
+        headers["X-Admin-Secret"] = admin_secret
 
     try:
         resp = requests.post(url, timeout=timeout, headers=headers)

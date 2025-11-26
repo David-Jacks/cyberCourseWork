@@ -17,6 +17,34 @@ import base64
 import json
 from typing import Optional
 
+
+def _maybe_load_keys_env():
+    env_path = os.path.join(os.path.dirname(__file__), "keys", "keys.env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_path)
+        return
+    except Exception:
+        pass
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k.strip(), v)
+    except Exception:
+        pass
+
+
+_maybe_load_keys_env()
+
 # Optional cryptographic helpers. If `REGISTRAR_PRIV_KEY` points to a PEM
 # private key, registration requests will be signed and include `X-Signature`.
 try:
@@ -29,12 +57,21 @@ BASE_URL = "http://localhost:5000"
 
 def add_voter(voter_id, name):
     url = f"{BASE_URL}/register"
+    # Basic client-side validation to catch common mistakes early. The server
+    # also enforces the regex, so this is just a convenience.
+    import re, os
+    id_re = os.environ.get("STUDENT_ID_REGEX")
+    if id_re and not re.match(id_re, str(voter_id)):
+        print("invalid voter_id format locally (matches STUDENT_ID_REGEX)")
+        return
+
     payload = {"voter_id": voter_id, "name": name}
     # If a Registrar private key is configured, sign the registration payload
     # and include the signature in headers. The server will verify it if it
     # has the corresponding public key.
     headers = {}
-    keypath = os.environ.get("REGISTRAR_PRIV_KEY")
+    # Prefer explicit signing key, fall back to legacy names
+    keypath = os.environ.get("REGISTRAR_SIGN_PRIV_KEY") or os.environ.get("REGISTRAR_PRIV_KEY") or os.environ.get("REGISTRAR_ENC_PRIV_KEY")
     payload_bytes = json.dumps(payload).encode("utf-8")
     if keypath and sign_ed25519 is not None:
         try:

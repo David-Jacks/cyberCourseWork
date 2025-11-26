@@ -7,6 +7,34 @@ import mytallier
 import os
 from secure_utils import hash_id, encrypt_ballot_for_two
 
+
+def _maybe_load_keys_env():
+    env_path = os.path.join(os.path.dirname(__file__), "keys", "keys.env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_path)
+        return
+    except Exception:
+        pass
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k.strip(), v)
+    except Exception:
+        pass
+
+
+_maybe_load_keys_env()
+
 #!/usr/bin/env python3
 """
 Simple HTTP GET client for http://localhost:5000
@@ -74,11 +102,11 @@ def submit_ballot(voter_id: str, choice: str, timeout: float = 5.0):
     # Prefer encrypting ballots client-side when Registrar and Tallier public
     # keys are configured. The encrypted payload requires both Registrar and
     # Tallier private keys to decrypt (see secure_utils).
-    reg_pub = os.environ.get("REGISTRAR_PUB_KEY")
-    tall_pub = os.environ.get("TALLIER_PUB_KEY")
+    reg_pub = os.environ.get("REGISTRAR_ENC_PUB_KEY") or os.environ.get("REGISTRAR_PUB_KEY") or os.environ.get("REGISTRAR_SIGN_PUB_KEY")
+    tall_pub = os.environ.get("TALLIER_ENC_PUB_KEY") or os.environ.get("TALLIER_PUB_KEY") or os.environ.get("TALLIER_SIGN_PUB_KEY")
 
     # require all three public keys (admin, registrar, tallier) for Shamir scheme
-    admin_pub = os.environ.get("ADMIN_PUB_KEY")
+    admin_pub = os.environ.get("ADMIN_ENC_PUB_KEY") or os.environ.get("ADMIN_PUB_KEY") or os.environ.get("ADMIN_SIGN_PUB_KEY")
     if admin_pub and reg_pub and tall_pub and hash_id is not None:
         try:
             from secure_utils import encrypt_ballot_shamir
@@ -93,6 +121,13 @@ def submit_ballot(voter_id: str, choice: str, timeout: float = 5.0):
             payload = {"encrypted": enc, "voter_hash": voter_hash}
             resp = requests.post(DEFAULT_HOST + "/vote", json=payload, timeout=timeout)
             return resp.status_code, resp.text
+
+    # Validate voter id locally if a regex is configured (server will
+    # enforce it too). This reduces obvious mistakes before sending.
+    import re
+    id_re = os.environ.get("STUDENT_ID_REGEX")
+    if id_re and not re.match(id_re, str(voter_id)):
+        raise ValueError("invalid voter_id format")
 
     # Fallback: send unhashed voter_id (existing behaviour) - servers may
     # expect this for deployments that haven't configured keys.

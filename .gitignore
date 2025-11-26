@@ -60,7 +60,7 @@ coverage.xml
 Thumbs.db
 
 # Environment files
-.env
+*.env
 .env.local
 .env.*.local
 

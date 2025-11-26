@@ -4,6 +4,7 @@
 This script expects the server to expose GET /ballots which returns
 {"ballots": [{"voter_id":..., "choice":...}, ...]}
 """
+BASE_URL = "http://localhost:5000"
 
 import requests
 from collections import Counter
@@ -14,7 +15,34 @@ try:
 except Exception:
     decrypt_ballot_with_both = None
 
-BASE_URL = "http://localhost:5000"
+
+def _maybe_load_keys_env():
+    env_path = os.path.join(os.path.dirname(__file__), "keys", "keys.env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_path)
+        return
+    except Exception:
+        pass
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k.strip(), v)
+    except Exception:
+        pass
+
+
+_maybe_load_keys_env()
+
 
 
 def fetch_ballots():
@@ -31,18 +59,18 @@ def tally_and_print():
         print("no ballots found")
         return
 
-    # Decryption requires both Registrar and Tallier private keys in this
-    # simple example. This enforces the "two-entity" requirement: both
-    # parties must participate to reveal plaintext ballots.
+   
     # For Shamir-based decryption we require Admin, Registrar and Tallier
     # private keys locally (3-of-3). This enforces that all three parties
     # must cooperate to decrypt ballots.
-    admin_priv = os.environ.get("ADMIN_PRIV_KEY")
-    reg_priv = os.environ.get("REGISTRAR_PRIV_KEY")
-    tall_priv = os.environ.get("TALLIER_PRIV_KEY")
+    admin_priv = os.environ.get("ADMIN_ENC_PRIV_KEY") or os.environ.get("ADMIN_PRIV_KEY") or os.environ.get("ADMIN_SIGN_PRIV_KEY")
+    reg_priv = os.environ.get("REGISTRAR_ENC_PRIV_KEY") or os.environ.get("REGISTRAR_PRIV_KEY") or os.environ.get("REGISTRAR_SIGN_PRIV_KEY")
+    tall_priv = os.environ.get("TALLIER_ENC_PRIV_KEY") or os.environ.get("TALLIER_PRIV_KEY") or os.environ.get("TALLIER_SIGN_PRIV_KEY")
 
     decrypted_choices = []
-    if admin_priv and reg_priv and tall_priv:
+    # Require at least two private keys to decrypt (Shamir threshold=2).
+    provided = [p for p in (admin_priv, reg_priv, tall_priv) if p]
+    if len(provided) >= 2:
         try:
             from secure_utils import decrypt_ballot_shamir_all
         except Exception:
@@ -69,16 +97,21 @@ def tally_and_print():
         print("Provide ADMIN_PRIV_KEY, REGISTRAR_PRIV_KEY and TALLIER_PRIV_KEY environment variables to tally.")
         return
 
+    # Determine winner (most common choice) but do NOT reveal counts
+    # or any mapping to voters. If there is a tie we list tied options.
     counts = Counter([c for c in decrypted_choices if c is not None])
+    if not counts:
+        print("no valid votes decrypted")
+        return
 
-    print("Election results:")
-    for choice, count in counts.most_common():
-        print(f"  {choice}: {count}")
+    most = counts.most_common()
+    top_count = most[0][1]
+    winners = [choice for choice, cnt in most if cnt == top_count]
 
-    # Optionally, print full voter list who voted (hashed ids only)
-    print("\nDetailed ballots:")
-    for b in ballots:
-        print(f"  {b.get('voter_hash')}: {b.get('encrypted') and '[encrypted]' or b.get('choice')}")
+    if len(winners) == 1:
+        print("Election winner:", winners[0])
+    else:
+        print("Election winners (tie):", ", ".join(winners))
 
 
 def tally_main():
