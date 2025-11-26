@@ -10,14 +10,13 @@ import requests
 from collections import Counter
 import os
 import json
-try:
-    from secure_utils import decrypt_ballot_with_both
-except Exception:
-    decrypt_ballot_with_both = None
+import base64
 
 
 def _maybe_load_keys_env():
-    env_path = os.path.join(os.path.dirname(__file__), "keys", "keys.env")
+    # Load canonical `keys.env` as specified in system design.
+    env_dir = os.path.join(os.path.dirname(__file__), "keys")
+    env_path = os.path.join(env_dir, "keys.env")
     if not os.path.exists(env_path):
         return
     try:
@@ -60,42 +59,73 @@ def tally_and_print():
         return
 
    
-    # For Shamir-based decryption we require Admin, Registrar and Tallier
-    # private keys locally (3-of-3). This enforces that all three parties
-    # must cooperate to decrypt ballots.
-    admin_priv = os.environ.get("ADMIN_ENC_PRIV_KEY") or os.environ.get("ADMIN_PRIV_KEY") or os.environ.get("ADMIN_SIGN_PRIV_KEY")
-    reg_priv = os.environ.get("REGISTRAR_ENC_PRIV_KEY") or os.environ.get("REGISTRAR_PRIV_KEY") or os.environ.get("REGISTRAR_SIGN_PRIV_KEY")
-    tall_priv = os.environ.get("TALLIER_ENC_PRIV_KEY") or os.environ.get("TALLIER_PRIV_KEY") or os.environ.get("TALLIER_SIGN_PRIV_KEY")
+    # For this design we expect ballots to be encrypted with the ELECTION
+    # public key. The election private key must be reconstructed via
+    # Shamir secret sharing from trustee shares (admin+tallier). The
+    # environment variables `ADMIN_SHARE` and `TALLIER_SHARE` are expected
+    # to contain share spec strings in the form `x:BASE64` (or path to a
+    # file containing that string). Two shares (threshold=2) are required.
+    admin_share_spec = os.environ.get("ADMIN_SHARE")
+    tallier_share_spec = os.environ.get("TALLIER_SHARE")
+
+    if not admin_share_spec or not tallier_share_spec:
+        print("ADMIN_SHARE and TALLIER_SHARE environment variables are required to reconstruct election private key.")
+        return
+
+    def _load_share(spec: str):
+        # spec may be 'x:BASE64' or a path to a file with that content
+        try:
+            if os.path.exists(spec):
+                with open(spec, "r") as f:
+                    spec = f.read().strip()
+            x_str, b64 = spec.split(":", 1)
+            x = int(x_str)
+            share_bytes = base64.b64decode(b64)
+            return (x, share_bytes)
+        except Exception:
+            return None
+
+    s_admin = _load_share(admin_share_spec)
+    s_tall = _load_share(tallier_share_spec)
+    if not s_admin or not s_tall:
+        print("Failed to parse share specs. Expected 'x:BASE64' or path to file containing it.")
+        return
+
+    try:
+        from secure_utils import combine_private_key_shares, decrypt_ballot_with_election_priv
+    except Exception:
+        print("required secure_utils helpers not available")
+        return
+
+    # Reconstruct election private key PEM bytes
+    try:
+        pem = combine_private_key_shares([s_admin, s_tall])
+    except Exception as e:
+        print("failed to combine shares:", e)
+        return
+
+    # Write reconstructed PEM to a temporary file to use decryption helper
+    import tempfile
+    tf = tempfile.NamedTemporaryFile(delete=False)
+    try:
+        tf.write(pem)
+        tf.flush()
+        priv_path = tf.name
+    finally:
+        tf.close()
 
     decrypted_choices = []
-    # Require at least two private keys to decrypt (Shamir threshold=2).
-    provided = [p for p in (admin_priv, reg_priv, tall_priv) if p]
-    if len(provided) >= 2:
-        try:
-            from secure_utils import decrypt_ballot_shamir_all
-        except Exception:
-            decrypt_ballot_shamir_all = None
-
-        if decrypt_ballot_shamir_all is None:
-            print("Shamir decryption helper not available (install cryptography?).")
-            return
-
-        for b in ballots:
-            enc = b.get("encrypted")
-            if enc:
-                try:
-                    pt = decrypt_ballot_shamir_all(admin_priv, reg_priv, tall_priv, enc)
-                    parsed = json.loads(pt.decode("utf-8"))
-                    decrypted_choices.append(parsed.get("choice"))
-                except Exception as e:
-                    print("warning: failed to decrypt a ballot:", e)
-            else:
-                # legacy/plain ballots
-                decrypted_choices.append(b.get("choice"))
-    else:
-        print("Admin, Registrar and Tallier private keys are required to decrypt ballots.")
-        print("Provide ADMIN_PRIV_KEY, REGISTRAR_PRIV_KEY and TALLIER_PRIV_KEY environment variables to tally.")
-        return
+    for b in ballots:
+        enc = b.get("encrypted_ballot")
+        if enc:
+            try:
+                pt = decrypt_ballot_with_election_priv(priv_path, enc)
+                parsed = json.loads(pt.decode("utf-8"))
+                decrypted_choices.append(parsed.get("choice"))
+            except Exception as e:
+                print("warning: failed to decrypt a ballot:", e)
+        else:
+            decrypted_choices.append(b.get("choice"))
 
     # Determine winner (most common choice) but do NOT reveal counts
     # or any mapping to voters. If there is a tie we list tied options.

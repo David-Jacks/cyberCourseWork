@@ -7,7 +7,9 @@ import json
 
 
 def _maybe_load_keys_env():
-    env_path = os.path.join(os.path.dirname(__file__), "keys", "keys.env")
+    # Load canonical `keys.env` as specified in system design.
+    env_dir = os.path.join(os.path.dirname(__file__), "keys")
+    env_path = os.path.join(env_dir, "keys.env")
     if not os.path.exists(env_path):
         return
     try:

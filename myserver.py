@@ -24,8 +24,9 @@ import base64
 
 
 def _maybe_load_keys_env():
-    # Load dotenv keys file if present so callers can rely on os.environ.
-    env_path = os.path.join(os.path.dirname(__file__), "keys", "keys.env")
+    # Load the required `keys.env` (single canonical file per design)
+    env_dir = os.path.join(os.path.dirname(__file__), "keys")
+    env_path = os.path.join(env_dir, "keys.env")
     if not os.path.exists(env_path):
         return
     try:
@@ -69,19 +70,21 @@ ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 # available they will be used; otherwise the server falls back to the
 # original behaviour (no verification/encryption).
 try:
-    from secure_utils import hash_id, verify_ed25519, encrypt_for_registrar
+    from secure_utils import hash_id, verify_ed25519, rsa_decrypt_from_b64, decrypt_ballot_with_election_priv, encrypt_for_registrar
 except Exception:
     hash_id = None
     verify_ed25519 = None
+    rsa_decrypt_from_b64 = None
+    decrypt_ballot_with_election_priv = None
     encrypt_for_registrar = None
 
-# Public key paths (signing vs encryption). Prefer explicit SIGN/ENC vars; fall back to legacy names.
-REGISTRAR_SIGN_PUB = os.environ.get("REGISTRAR_SIGN_PUB_KEY") or os.environ.get("REGISTRAR_PUB_KEY")
-REGISTRAR_ENC_PUB = os.environ.get("REGISTRAR_ENC_PUB_KEY") or os.environ.get("REGISTRAR_PUB_KEY")
-ADMIN_SIGN_PUB = os.environ.get("ADMIN_SIGN_PUB_KEY") or os.environ.get("ADMIN_PUB_KEY")
-ADMIN_ENC_PUB = os.environ.get("ADMIN_ENC_PUB_KEY") or os.environ.get("ADMIN_PUB_KEY")
-TALLIER_SIGN_PUB = os.environ.get("TALLIER_SIGN_PUB_KEY") or os.environ.get("TALLIER_PUB_KEY")
-TALLIER_ENC_PUB = os.environ.get("TALLIER_ENC_PUB_KEY") or os.environ.get("TALLIER_PUB_KEY")
+# Public key paths (signing). Server/private key path for decrypting hashed IDs.
+REGISTRAR_SIGN_PUB = os.environ.get("REGISTRAR_SIGN_PUB_KEY")
+ADMIN_SIGN_PUB = os.environ.get("ADMIN_SIGN_PUB_KEY")
+TALLIER_SIGN_PUB = os.environ.get("TALLIER_SIGN_PUB_KEY")
+SERVER_PRIV = os.environ.get("SERVER_PRIV_KEY")
+ELECTION_PUB = os.environ.get("ELECTION_PUB_KEY")
+REGISTRAR_ENC_PUB = os.environ.get("REGISTRAR_ENC_PUB_KEY")
 
 
 class ElectionState:
@@ -120,6 +123,26 @@ voters = {}
 options = ["Paris", "Rome", "Bahamas", "Lisbon"]
 ballots = []
 storage_lock = threading.Lock()
+
+# Optional student database (list of allowed student identifiers). If
+# `STUDENT_DB_FILE` env var is set it should point to a file with one
+# student identifier per line; the server will store the hashed values
+# (using `hash_id`) for membership checks.
+student_db = set()
+db_file = os.environ.get("STUDENT_DB_FILE")
+if db_file and os.path.exists(db_file):
+    try:
+        with open(db_file, "r") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                if hash_id is not None:
+                    student_db.add(hash_id(s))
+                else:
+                    student_db.add(s)
+    except Exception:
+        student_db = set()
 
 
 def send_json(handler, obj, status=200):
@@ -233,36 +256,67 @@ class reqHandler(BaseHTTPRequestHandler):
                     send_text(self, "invalid signature format\n", status=403)
                     return
 
-            voter_id = payload.get("voter_id")
-            name = payload.get("name")
-            if not voter_id or not name:
-                send_text(self, "missing voter_id or name\n", status=400)
+            # Accept either an encrypted hashed voter handle (`enc_voter_hash`),
+            # a pre-hashed `voter_hash`, or a raw `voter_id`. Registrar clients
+            # should send `enc_voter_hash` (encrypted to server) and `enc_name`
+            # when available so no raw identifiers are transmitted.
+            enc_voter_hash = payload.get("enc_voter_hash")
+            voter_hash = payload.get("voter_hash")
+            raw_voter_id = payload.get("voter_id")
+            enc_name = payload.get("enc_name")
+            plain_name = payload.get("name")
+
+            if not enc_voter_hash and not voter_hash and not raw_voter_id:
+                send_text(self, "missing voter identifier\n", status=400)
                 return
 
-            # Validate voter_id format to prevent guessing attacks.
-            if not _ID_PATTERN.match(str(voter_id)):
-                send_text(self, "invalid voter_id format\n", status=400)
-                return
-
-            # Hash the voter_id before storing to avoid keeping raw identifiers.
-            vhash = hash_id(voter_id) if hash_id is not None else voter_id
-
-            # Encrypt the voter's name for the Registrar so only the Registrar
-            # can recover names. If no registrar public key is configured we
-            # fallback to storing the clear name (development mode only).
-            if encrypt_for_registrar is not None and REGISTRAR_ENC_PUB:
+            vhash = None
+            if enc_voter_hash:
+                # Decrypt encrypted hashed id using server private key
+                if rsa_decrypt_from_b64 is None or not SERVER_PRIV:
+                    send_text(self, "server decryption unavailable\n", status=500)
+                    return
                 try:
-                    enc_name = encrypt_for_registrar(REGISTRAR_ENC_PUB, name.encode("utf-8"))
+                    plain = rsa_decrypt_from_b64(SERVER_PRIV, enc_voter_hash)
+                    vhash = plain.decode("utf-8")
                 except Exception:
-                    enc_name = name
+                    send_text(self, "failed to decrypt voter identifier\n", status=400)
+                    return
+            elif voter_hash:
+                vhash = voter_hash
             else:
-                enc_name = name
+                # Validate and hash raw voter id
+                if not _ID_PATTERN.match(str(raw_voter_id)):
+                    send_text(self, "invalid voter_id format\n", status=400)
+                    return
+                vhash = hash_id(raw_voter_id) if hash_id is not None else raw_voter_id
+
+            # If a student_db is configured, require that the hashed id is listed
+            if student_db and vhash not in student_db:
+                send_text(self, "student details not recognised\n", status=403)
+                return
+
+            # Determine how the name is provided: prefer `enc_name` (already
+            # encrypted by the Registrar), else accept plaintext `name` and
+            # encrypt it for the Registrar if configured.
+            if enc_name:
+                stored_name = enc_name
+            elif plain_name:
+                if encrypt_for_registrar is not None and REGISTRAR_ENC_PUB:
+                    try:
+                        stored_name = encrypt_for_registrar(REGISTRAR_ENC_PUB, plain_name.encode("utf-8"))
+                    except Exception:
+                        stored_name = plain_name
+                else:
+                    stored_name = plain_name
+            else:
+                stored_name = ""
 
             with storage_lock:
                 if vhash in voters:
                     send_text(self, "voter already registered\n", status=409)
                     return
-                voters[vhash] = enc_name
+                voters[vhash] = stored_name
 
             # Return non-sensitive confirmation (we do not echo raw voter_id)
             send_json(self, {"voter_hash": vhash, "name_encrypted": bool(REGISTRAR_ENC_PUB)}, status=201)
@@ -307,30 +361,36 @@ class reqHandler(BaseHTTPRequestHandler):
                 send_text(self, "invalid JSON\n", status=400)
                 return
 
-            # Support encrypted ballots: the client can submit an `encrypted`
-            # object (produced by secure_utils.encrypt_ballot_for_two). The
-            # request must also include `voter_hash` so the server can check
-            # registration and prevent double voting without learning the raw id.
-            enc = payload.get("encrypted")
-            voter_hash = payload.get("voter_hash")
+            # Support encrypted ballots: client should send `enc_voter_hash`
+            # (RSA-OAEP encrypted hashed id to server) and `encrypted_ballot`
+            # (hybrid AES-GCM + RSA-OAEP ciphertext encrypted to election pub).
+            enc_ballot = payload.get("encrypted_ballot")
+            enc_voter_hash = payload.get("enc_voter_hash")
 
-            if enc:
-                if not voter_hash:
-                    send_text(self, "missing voter_hash for encrypted ballot\n", status=400)
+            if enc_ballot:
+                if not enc_voter_hash:
+                    send_text(self, "missing enc_voter_hash for encrypted ballot\n", status=400)
+                    return
+                if rsa_decrypt_from_b64 is None or not SERVER_PRIV:
+                    send_text(self, "server decryption unavailable\n", status=500)
+                    return
+                try:
+                    vhash = rsa_decrypt_from_b64(SERVER_PRIV, enc_voter_hash).decode("utf-8")
+                except Exception:
+                    send_text(self, "failed to decrypt voter identifier\n", status=400)
                     return
 
                 with storage_lock:
-                    if voter_hash not in voters:
+                    if vhash not in voters:
                         send_text(self, "Student not registered, speak to the Registrar,\n", status=403)
                         return
                     # prevent double-voting by hashed id
-                    if any(b.get("voter_hash") == voter_hash for b in ballots):
+                    if any(b.get("voter_hash") == vhash for b in ballots):
                         send_text(self, "You already voted, you are allowed to vote once for fairness\n", status=409)
                         return
 
-                    # Save encrypted ballot as-is; decryption requires both
-                    # Registrar and Tallier private keys.
-                    ballots.append({"voter_hash": voter_hash, "encrypted": enc})
+                    # Store encrypted ballot as-is (server never holds election private key)
+                    ballots.append({"voter_hash": vhash, "encrypted_ballot": enc_ballot})
 
                 send_text(self, "Ballot accepted\n", status=201)
                 return

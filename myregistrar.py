@@ -19,7 +19,9 @@ from typing import Optional
 
 
 def _maybe_load_keys_env():
-    env_path = os.path.join(os.path.dirname(__file__), "keys", "keys.env")
+    # Load canonical `keys.env` as specified in system design.
+    env_dir = os.path.join(os.path.dirname(__file__), "keys")
+    env_path = os.path.join(env_dir, "keys.env")
     if not os.path.exists(env_path):
         return
     try:
@@ -65,7 +67,52 @@ def add_voter(voter_id, name):
         print("invalid voter_id format locally (matches STUDENT_ID_REGEX)")
         return
 
-    payload = {"voter_id": voter_id, "name": name}
+    # Hash the voter id and encrypt the name for transport/storage.
+    try:
+        from secure_utils import hash_id, encrypt_for_registrar
+    except Exception:
+        hash_id = None
+        encrypt_for_registrar = None
+
+    # Validate locally against regex if configured
+    import re
+    id_re = os.environ.get("STUDENT_ID_REGEX")
+    if id_re and not re.match(id_re, str(voter_id)):
+        print("invalid voter_id format locally (matches STUDENT_ID_REGEX)")
+        return
+
+    voter_hash = hash_id(voter_id) if hash_id is not None else voter_id
+
+    # Encrypt the hashed voter id to the server so nothing raw is sent.
+    try:
+        from secure_utils import rsa_encrypt_to_b64
+    except Exception:
+        rsa_encrypt_to_b64 = None
+
+    enc_voter_hash = None
+    if rsa_encrypt_to_b64 is not None and os.environ.get("SERVER_PUB_KEY"):
+        try:
+            enc_voter_hash = rsa_encrypt_to_b64(os.environ.get("SERVER_PUB_KEY"), voter_hash.encode("utf-8"))
+        except Exception:
+            enc_voter_hash = None
+
+    # Encrypt name for Registrar (so only Registrar can decrypt stored names)
+    enc_name = None
+    if encrypt_for_registrar is not None and os.environ.get("REGISTRAR_ENC_PUB_KEY"):
+        try:
+            enc_name = encrypt_for_registrar(os.environ.get("REGISTRAR_ENC_PUB_KEY"), name.encode("utf-8"))
+        except Exception:
+            enc_name = None
+
+    payload = {}
+    if enc_voter_hash:
+        payload["enc_voter_hash"] = enc_voter_hash
+    else:
+        payload["voter_hash"] = voter_hash
+    if enc_name:
+        payload["enc_name"] = enc_name
+    else:
+        payload["name"] = name
     # If a Registrar private key is configured, sign the registration payload
     # and include the signature in headers. The server will verify it if it
     # has the corresponding public key.

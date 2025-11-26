@@ -349,6 +349,67 @@ def decrypt_for_registrar(registrar_priv_path: str, b64cipher: str) -> bytes:
     return _rsa_decrypt(priv, base64.b64decode(b64cipher))
 
 
+def rsa_encrypt_to_b64(pub_path: str, plaintext: bytes) -> str:
+    """Encrypt small plaintext with RSA-OAEP and return base64 ciphertext."""
+    pub = load_public_key(pub_path)
+    ct = _rsa_encrypt(pub, plaintext)
+    return base64.b64encode(ct).decode("ascii")
+
+
+def rsa_decrypt_from_b64(priv_path: str, b64cipher: str) -> bytes:
+    """Decrypt base64 RSA-OAEP ciphertext returning plaintext bytes."""
+    priv = load_private_key(priv_path)
+    return _rsa_decrypt(priv, base64.b64decode(b64cipher))
+
+
+def encrypt_ballot_with_election_pub(election_pub_path: str, plaintext: bytes) -> Dict:
+    """Hybrid encrypt plaintext to election RSA public key.
+
+    Returns a dict with base64-encoded AES-GCM ciphertext, nonce and
+    the AES key encrypted with the election RSA public key.
+    """
+    pub = load_public_key(election_pub_path)
+    # symmetric key
+    K = secrets.token_bytes(32)
+    aesgcm = AESGCM(K)
+    nonce = secrets.token_bytes(12)
+    ct = aesgcm.encrypt(nonce, plaintext, associated_data=None)
+    enc_key = _rsa_encrypt(pub, K)
+    return {
+        "ciphertext": base64.b64encode(ct).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "enc_key": base64.b64encode(enc_key).decode("ascii"),
+        "alg": "AESGCM+RSA-OAEP-v1",
+    }
+
+
+def decrypt_ballot_with_election_priv(election_priv_path: str, payload: Dict) -> bytes:
+    """Decrypt payload created by `encrypt_ballot_with_election_pub` using election private key."""
+    ct = base64.b64decode(payload["ciphertext"])
+    nonce = base64.b64decode(payload["nonce"])
+    enc_key = base64.b64decode(payload["enc_key"])
+    priv = load_private_key(election_priv_path)
+    K = _rsa_decrypt(priv, enc_key)
+    aesgcm = AESGCM(K)
+    pt = aesgcm.decrypt(nonce, ct, associated_data=None)
+    return pt
+
+
+def split_private_key_shares(priv_path: str, n: int, k: int):
+    """Load private key PEM bytes and split into `n` shares with threshold `k`.
+
+    Returns list of (x, share_bytes).
+    """
+    with open(priv_path, "rb") as f:
+        pem = f.read()
+    return shamir_split(pem, n, k)
+
+
+def combine_private_key_shares(shares):
+    """Combine shares (list of (x, share_bytes)) to recover private key PEM bytes."""
+    return shamir_combine(shares)
+
+
 # ---- ElGamal on EC (hybrid) ----
 def elgamal_keygen(curve: ec.EllipticCurve = ec.SECP256R1()):
     """Generate an EC keypair for ElGamal-style hybrid encryption.

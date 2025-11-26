@@ -5,11 +5,16 @@ import myregistrar
 import myadmin
 import mytallier
 import os
-from secure_utils import hash_id, encrypt_ballot_for_two
+try:
+    from secure_utils import hash_id
+except Exception:
+    hash_id = None
 
 
 def _maybe_load_keys_env():
-    env_path = os.path.join(os.path.dirname(__file__), "keys", "keys.env")
+    # Load canonical `keys.env` as specified in system design.
+    env_dir = os.path.join(os.path.dirname(__file__), "keys")
+    env_path = os.path.join(env_dir, "keys.env")
     if not os.path.exists(env_path):
         return
     try:
@@ -99,28 +104,30 @@ def get_options(timeout: float = 5.0):
 
 def submit_ballot(voter_id: str, choice: str, timeout: float = 5.0):
     """Submit a ballot. Returns (status_code, text) or raises requests.RequestException."""
-    # Prefer encrypting ballots client-side when Registrar and Tallier public
-    # keys are configured. The encrypted payload requires both Registrar and
-    # Tallier private keys to decrypt (see secure_utils).
-    reg_pub = os.environ.get("REGISTRAR_ENC_PUB_KEY") or os.environ.get("REGISTRAR_PUB_KEY") or os.environ.get("REGISTRAR_SIGN_PUB_KEY")
-    tall_pub = os.environ.get("TALLIER_ENC_PUB_KEY") or os.environ.get("TALLIER_PUB_KEY") or os.environ.get("TALLIER_SIGN_PUB_KEY")
+    # Require `ELECTION_PUB_KEY` and `SERVER_PUB_KEY` to be configured
+    # per design: ballots are encrypted with the election public key and
+    # hashed voter identifiers are encrypted to the server public key.
+    election_pub = os.environ.get("ELECTION_PUB_KEY")
+    server_pub = os.environ.get("SERVER_PUB_KEY")
 
-    # require all three public keys (admin, registrar, tallier) for Shamir scheme
-    admin_pub = os.environ.get("ADMIN_ENC_PUB_KEY") or os.environ.get("ADMIN_PUB_KEY") or os.environ.get("ADMIN_SIGN_PUB_KEY")
-    if admin_pub and reg_pub and tall_pub and hash_id is not None:
-        try:
-            from secure_utils import encrypt_ballot_shamir
-        except Exception:
-            encrypt_ballot_shamir = None
+    if not election_pub or not server_pub or hash_id is None:
+        raise RuntimeError("Missing ELECTION_PUB_KEY, SERVER_PUB_KEY or hashing support; refusing to send raw identifiers per policy")
 
-        if encrypt_ballot_shamir is not None:
-            voter_hash = hash_id(voter_id)
-            ballot = {"voter_hash": voter_hash, "choice": choice}
-            plaintext = json.dumps(ballot).encode("utf-8")
-            enc = encrypt_ballot_shamir(admin_pub, reg_pub, tall_pub, plaintext)
-            payload = {"encrypted": enc, "voter_hash": voter_hash}
-            resp = requests.post(DEFAULT_HOST + "/vote", json=payload, timeout=timeout)
-            return resp.status_code, resp.text
+    try:
+        from secure_utils import encrypt_ballot_with_election_pub, rsa_encrypt_to_b64
+    except Exception:
+        raise RuntimeError("Required crypto helpers not available in secure_utils")
+
+    voter_hash = hash_id(voter_id)
+    # Encrypt hashed id to server
+    enc_voter_hash = rsa_encrypt_to_b64(server_pub, voter_hash.encode("utf-8"))
+    # Encrypt ballot to election public key
+    ballot = {"voter_hash": voter_hash, "choice": choice}
+    plaintext = json.dumps(ballot).encode("utf-8")
+    enc_ballot = encrypt_ballot_with_election_pub(election_pub, plaintext)
+    payload = {"enc_voter_hash": enc_voter_hash, "encrypted_ballot": enc_ballot}
+    resp = requests.post(DEFAULT_HOST + "/vote", json=payload, timeout=timeout)
+    return resp.status_code, resp.text
 
     # Validate voter id locally if a regex is configured (server will
     # enforce it too). This reduces obvious mistakes before sending.
@@ -130,9 +137,8 @@ def submit_ballot(voter_id: str, choice: str, timeout: float = 5.0):
         raise ValueError("invalid voter_id format")
 
     # Fallback: send unhashed voter_id (existing behaviour) - servers may
-    # expect this for deployments that haven't configured keys.
-    resp = requests.post(DEFAULT_HOST + "/vote", json={"voter_id": voter_id, "choice": choice}, timeout=timeout)
-    return resp.status_code, resp.text
+    # NOTE: code flow should not reach here; submission returns earlier.
+    raise RuntimeError("unexpected fallback - ballot not submitted")
 
 
 def sys_stater(timeout: float = 5.0):
