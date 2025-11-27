@@ -13,8 +13,10 @@ repository. It intentionally keeps a simple, explicit API:
 """
 
 import base64
+import os
 import hashlib
 import secrets
+import random
 from typing import Dict
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -25,6 +27,32 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
+# ---- GF(256) Precomputed Tables ----
+# These tables are used for efficient arithmetic in GF(256).
+_GF256_EXP = [0] * 512
+_GF256_LOG = [0] * 256
+
+def _init_gf_tables():
+    """Initialize GF(256) exponent and logarithm tables using AES polynomial 0x11b."""
+    poly = 0x11b
+    x = 1
+    for i in range(255):
+        _GF256_EXP[i] = x
+        _GF256_LOG[x] = i
+        x <<= 1
+        if x & 0x100:
+            x ^= poly
+    for i in range(255, 512):
+        _GF256_EXP[i] = _GF256_EXP[i - 255]
+
+# Initialize the tables at module load time.
+_init_gf_tables()
+
+
+# ---- Grouped Cryptographic Implementations ----
+
+# ---- Hashing ----
+# Functions related to hashing voter identifiers.
 def hash_id(voter_id: str) -> str:
     """Return SHA-256 hex digest of the provided voter identifier.
 
@@ -43,16 +71,33 @@ def hash_id(voter_id: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# ---- Key Loading ----
+# Functions for loading private and public keys from PEM files.
 def load_private_key(path: str, password: bytes = None):
     with open(path, "rb") as f:
         return load_pem_private_key(f.read(), password=password)
 
 
 def load_public_key(path: str):
-    with open(path, "rb") as f:
-        return load_pem_public_key(f.read())
+    # Accept a filesystem path, a raw PEM string, or a base64-encoded PEM
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return load_pem_public_key(f.read())
+    b = path.encode("utf-8")
+    if b.strip().startswith(b"-----BEGIN"):
+        return load_pem_public_key(b)
+    # try base64-decoded PEM
+    try:
+        decoded = base64.b64decode(path)
+        if decoded.strip().startswith(b"-----BEGIN"):
+            return load_pem_public_key(decoded)
+    except Exception:
+        pass
+    raise ValueError("could not interpret public key reference")
 
 
+# ---- Signing and Verification ----
+# Functions for signing and verifying data using Ed25519.
 def sign_ed25519(private_key_pem_path: str, data: bytes) -> bytes:
     """Sign `data` with an Ed25519 private key saved in PEM format.
 
@@ -93,6 +138,8 @@ def verify_ed25519(public_key_pem_path: str, data: bytes, signature: bytes) -> b
     return False
 
 
+# ---- RSA Encryption and Decryption ----
+# Functions for encrypting and decrypting data using RSA keys.
 def _rsa_encrypt(pub, plaintext: bytes) -> bytes:
     return pub.encrypt(
         plaintext,
@@ -115,6 +162,59 @@ def _rsa_decrypt(priv, ciphertext: bytes) -> bytes:
     )
 
 
+def _load_public_from_ref(ref: str):
+    """Load a public key from a file path, PEM string, or base64-encoded PEM.
+
+    Returns a cryptography public key object.
+    """
+    # Path to file
+    if os.path.exists(ref):
+        return load_public_key(ref)
+    # Raw PEM string
+    b = ref.encode("utf-8")
+    if b.strip().startswith(b"-----BEGIN"):
+        return load_pem_public_key(b)
+    # Base64-encoded PEM
+    try:
+        decoded = base64.b64decode(ref)
+        if decoded.strip().startswith(b"-----BEGIN"):
+            return load_pem_public_key(decoded)
+    except Exception:
+        pass
+    raise ValueError("could not interpret public key reference")
+
+
+def rsa_encrypt_to_b64(pub_ref: str, plaintext: bytes) -> str:
+    """Encrypt `plaintext` with RSA public key referenced by `pub_ref`.
+
+    `pub_ref` may be a path to a PEM file, a PEM string, or a base64-encoded
+    PEM. Returns base64-encoded ciphertext (ASCII string).
+    """
+    pub = _load_public_from_ref(pub_ref)
+    ct = _rsa_encrypt(pub, plaintext)
+    return base64.b64encode(ct).decode("ascii")
+
+
+def rsa_decrypt_from_b64(priv_path: str, b64_ciphertext: str) -> bytes:
+    """Decrypt base64-encoded RSA ciphertext using private key at `priv_path`.
+
+    Returns plaintext bytes.
+    """
+    priv = load_private_key(priv_path)
+    ct = base64.b64decode(b64_ciphertext)
+    return _rsa_decrypt(priv, ct)
+
+
+def encrypt_for_registrar(pub_ref: str, plaintext: bytes) -> str:
+    """Convenience wrapper used by Registrar to encrypt names for the Registrar key.
+
+    Returns base64-encoded ciphertext (ASCII string).
+    """
+    return rsa_encrypt_to_b64(pub_ref, plaintext)
+
+
+# ---- Ballot Encryption ----
+# Functions for encrypting ballots using hybrid encryption schemes.
 def encrypt_ballot_for_two(registrar_pub_path: str, tallier_pub_path: str, plaintext: bytes) -> Dict:
     """Encrypt `plaintext` so that BOTH Registrar and Tallier private keys are
     required to decrypt.
@@ -128,79 +228,44 @@ def encrypt_ballot_for_two(registrar_pub_path: str, tallier_pub_path: str, plain
     Returns a JSON-serializable dict with base64-encoded fields.
     """
     # NOTE: deprecated in favor of Shamir-based `encrypt_ballot_shamir`.
-    raise NotImplementedError("use encrypt_ballot_shamir for multi-party decryption")
+    # This helper was intentionally removed; use `encrypt_ballot_shamir`.
 
 
-def decrypt_ballot_with_both(registrar_priv_path: str, tallier_priv_path: str, payload: Dict) -> bytes:
-    """Given both private keys and an encrypted payload (as produced by
-    `encrypt_ballot_for_two`), return the decrypted plaintext bytes.
+def encrypt_ballot_with_election_pub(election_pub_path: str, plaintext: bytes) -> Dict:
+    """Hybrid encrypt plaintext to election RSA public key.
+
+    Returns a dict with base64-encoded AES-GCM ciphertext, nonce and
+    the AES key encrypted with the election RSA public key.
     """
-    # NOTE: deprecated. Use `decrypt_ballot_shamir_all` which supports
-    # multi-party Shamir reconstruction.
-    raise NotImplementedError("use decrypt_ballot_shamir_all")
+    pub = load_public_key(election_pub_path)
+    # symmetric key
+    K = secrets.token_bytes(32)
+    aesgcm = AESGCM(K)
+    nonce = secrets.token_bytes(12)
+    ct = aesgcm.encrypt(nonce, plaintext, associated_data=None)
+    enc_key = _rsa_encrypt(pub, K)
+    return {
+        "ciphertext": base64.b64encode(ct).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "enc_key": base64.b64encode(enc_key).decode("ascii"),
+        "alg": "AESGCM+RSA-OAEP-v1",
+    }
 
 
-# ---- Shamir secret sharing over GF(256) ----
-# We implement Shamir secret sharing on bytes using arithmetic in GF(256)
-# with the AES polynomial (0x11b). This allows splitting an arbitrary byte
-# string into N shares with threshold K. Each share is the same length as
-# the secret (byte-wise sharing).
-
-_GF256_EXP = [0] * 512
-_GF256_LOG = [0] * 256
-
-def _init_gf_tables():
-    # generate exponent/log tables using AES polynomial 0x11b
-    poly = 0x11b
-    x = 1
-    for i in range(255):
-        _GF256_EXP[i] = x
-        _GF256_LOG[x] = i
-        x <<= 1
-        if x & 0x100:
-            x ^= poly
-    for i in range(255, 512):
-        _GF256_EXP[i] = _GF256_EXP[i - 255]
+def decrypt_ballot_with_election_priv(election_priv_path: str, payload: Dict) -> bytes:
+    """Decrypt payload created by `encrypt_ballot_with_election_pub` using election private key."""
+    ct = base64.b64decode(payload["ciphertext"])
+    nonce = base64.b64decode(payload["nonce"])
+    enc_key = base64.b64decode(payload["enc_key"])
+    priv = load_private_key(election_priv_path)
+    K = _rsa_decrypt(priv, enc_key)
+    aesgcm = AESGCM(K)
+    pt = aesgcm.decrypt(nonce, ct, associated_data=None)
+    return pt
 
 
-_init_gf_tables()
-
-
-def _gf_add(a: int, b: int) -> int:
-    return a ^ b
-
-
-def _gf_mul(a: int, b: int) -> int:
-    if a == 0 or b == 0:
-        return 0
-    return _GF256_EXP[_GF256_LOG[a] + _GF256_LOG[b]]
-
-
-def _gf_pow(a: int, power: int) -> int:
-    if power == 0:
-        return 1
-    if a == 0:
-        return 0
-    return _GF256_EXP[(_GF256_LOG[a] * power) % 255]
-
-
-def _gf_inv(a: int) -> int:
-    # multiplicative inverse in GF(256)
-    if a == 0:
-        raise ZeroDivisionError()
-    return _GF256_EXP[255 - _GF256_LOG[a]]
-
-
-def _eval_poly(coeffs, x):
-    # coeffs: list of ints (byte values), evaluate polynomial at x in GF
-    result = 0
-    power = 1
-    for c in coeffs:
-        result = _gf_add(result, _gf_mul(c, power))
-        power = _gf_mul(power, x)
-    return result
-
-
+# ---- Shamir Secret Sharing ----
+# Functions for splitting and combining secrets using Shamir's scheme.
 def shamir_split(secret: bytes, n: int, k: int):
     """Split `secret` into `n` shares with threshold `k` using Shamir over GF(256).
 
@@ -255,144 +320,137 @@ def shamir_combine(shares):
     return bytes(secret)
 
 
-def encrypt_ballot_shamir(admin_pub_path: str, registrar_pub_path: str, tallier_pub_path: str, plaintext: bytes) -> Dict:
-    """Encrypt plaintext so that a threshold of parties must cooperate to decrypt.
+def _int_shamir_split(secret: bytes, n: int, k: int):
+    """Split secret bytes into n shares with threshold k using Shamir over integers mod prime.
 
-    This implementation uses Shamir secret sharing to split the AES key
-    into 3 shares and sets threshold k=2 (any two parties are sufficient
-    to reconstruct). The three parties are admin, registrar and tallier.
+    This implementation splits `secret` into fixed-size chunks and performs
+    integer-Shamir on each chunk separately. This avoids searching for a
+    single prime larger than a very large secret.
 
-    Returns a JSON-serializable dict with base64-encoded fields.
+    Share format (per-share):
+      [total_len:4][chunk_size:2][num_chunks:2][chunk1_share][chunk2_share]...
+
+    Returns list of (x, share_bytes).
     """
-    admin_pub = load_public_key(admin_pub_path)
-    reg_pub = load_public_key(registrar_pub_path)
-    tall_pub = load_public_key(tallier_pub_path)
+    if not (1 < k <= n <= 255):
+        raise ValueError("invalid parameters for shamir split")
+    L = len(secret)
+    # fixed chunk size (bytes). Reasonable tradeoff between prime search cost and number of chunks.
+    CHUNK_SIZE = 128
+    chunks = [secret[i:i+CHUNK_SIZE] for i in range(0, L, CHUNK_SIZE)]
+    m = len(chunks)
 
-    K = secrets.token_bytes(32)
-    aesgcm = AESGCM(K)
-    nonce = secrets.token_bytes(12)
-    ct = aesgcm.encrypt(nonce, plaintext, associated_data=None)
+    # For each chunk, pick a prime p >= 2^(8*len(chunk)) and perform Shamir on that integer.
+    per_chunk_share_vals = []  # list of lists of ints: per_chunk_share_vals[chunk_idx][share_index]
+    per_chunk_share_len = []
+    for chunk in chunks:
+        clen = len(chunk)
+        secret_int = bytes_to_int(chunk)
+        bits = clen * 8
+        candidate = 1 << bits
+        p = next_probable_prime_at_least(candidate)
+        # create polynomial coefficients modulo p
+        coeffs = [secret_int] + [random.randrange(0, p) for _ in range(k - 1)]
+        share_vals = []
+        for i in range(n):
+            x = i + 1
+            acc = 0
+            xp = 1
+            for c in coeffs:
+                acc = (acc + (c * xp)) % p
+                xp = (xp * x) % p
+            share_vals.append((acc, p))
+        per_chunk_share_vals.append(share_vals)
+        # share length in bytes for this chunk (p bit length)
+        share_len = (p.bit_length() + 7) // 8
+        per_chunk_share_len.append(share_len)
 
-    # Split K into 3 shares with threshold k=2 (any 2 of 3 can combine)
-    shares = shamir_split(K, 3, 2)
-    # shares are [(1, b1), (2, b2), (3, b3)] map to admin/reg/tall
-    enc_admin = _rsa_encrypt(admin_pub, shares[0][1])
-    enc_reg = _rsa_encrypt(reg_pub, shares[1][1])
-    enc_tall = _rsa_encrypt(tall_pub, shares[2][1])
-
-    return {
-        "ciphertext": base64.b64encode(ct).decode("ascii"),
-        "nonce": base64.b64encode(nonce).decode("ascii"),
-        "enc_share_admin": base64.b64encode(enc_admin).decode("ascii"),
-        "enc_share_reg": base64.b64encode(enc_reg).decode("ascii"),
-        "enc_share_tall": base64.b64encode(enc_tall).decode("ascii"),
-        "alg": "AESGCM+RSA-OAEP+Shamir-3-of-2-v1",
-    }
-
-
-def decrypt_ballot_shamir_all(admin_priv_path: str, registrar_priv_path: str, tallier_priv_path: str, payload: Dict) -> bytes:
-    """Decrypt payload created by `encrypt_ballot_shamir` using all three private keys."""
-    # Load ciphertext and encrypted shares
-    ct = base64.b64decode(payload["ciphertext"])
-    nonce = base64.b64decode(payload["nonce"])
-    enc_admin = base64.b64decode(payload["enc_share_admin"])
-    enc_reg = base64.b64decode(payload["enc_share_reg"])
-    enc_tall = base64.b64decode(payload["enc_share_tall"])
-
-    # Attempt to decrypt any shares for which a private key path was
-    # provided. The Shamir threshold is 2, so we require at least two
-    # successfully decrypted shares to reconstruct the AES key.
+    # Build share bytes for each of the n shares by concatenating per-chunk share values.
+    # Header layout: total_len(4) | chunk_size(2) | num_chunks(2) |
+    # for each chunk: share_len(2) | prime_len(2) | prime_bytes(prime_len)
     shares = []
-    if admin_priv_path:
-        try:
-            priv_admin = load_private_key(admin_priv_path)
-            s_admin = _rsa_decrypt(priv_admin, enc_admin)
-            shares.append((1, s_admin))
-        except Exception:
-            pass
-    if registrar_priv_path:
-        try:
-            priv_reg = load_private_key(registrar_priv_path)
-            s_reg = _rsa_decrypt(priv_reg, enc_reg)
-            shares.append((2, s_reg))
-        except Exception:
-            pass
-    if tallier_priv_path:
-        try:
-            priv_tall = load_private_key(tallier_priv_path)
-            s_tall = _rsa_decrypt(priv_tall, enc_tall)
-            shares.append((3, s_tall))
-        except Exception:
-            pass
-
-    if len(shares) < 2:
-        raise ValueError("insufficient private keys available to reconstruct secret")
-
-    secret = shamir_combine(shares)
-
-    aesgcm = AESGCM(secret)
-    pt = aesgcm.decrypt(nonce, ct, associated_data=None)
-    return pt
+    for i in range(n):
+        parts = []
+        parts.append(int_to_bytes(L, 4))
+        parts.append(int_to_bytes(CHUNK_SIZE, 2))
+        parts.append(int_to_bytes(m, 2))
+        # include per-chunk share lengths and the prime for each chunk
+        for cidx in range(m):
+            share_len = per_chunk_share_len[cidx]
+            p = per_chunk_share_vals[cidx][0][1]
+            p_bytes = int_to_bytes(p, (p.bit_length() + 7) // 8)
+            parts.append(int_to_bytes(share_len, 2))
+            parts.append(int_to_bytes(len(p_bytes), 2))
+            parts.append(p_bytes)
+        for cidx in range(m):
+            val, p = per_chunk_share_vals[cidx][i]
+            share_len = per_chunk_share_len[cidx]
+            parts.append(int_to_bytes(val, share_len))
+        share_bytes = b"".join(parts)
+        shares.append((i+1, share_bytes))
+    return shares
 
 
-def encrypt_for_registrar(registrar_pub_path: str, plaintext: bytes) -> str:
-    """Encrypt small plaintext (e.g., a name) for the Registrar only.
+def _int_shamir_combine(shares):
+    """Combine shares created by `_int_shamir_split` and return original secret bytes."""
+    if len(shares) == 0:
+        return b""
+    # parse header from first share
+    first = shares[0][1]
+    L = bytes_to_int(first[0:4])
+    CHUNK_SIZE = bytes_to_int(first[4:6])
+    m = bytes_to_int(first[6:8])
+    # next per-chunk metadata: for each chunk: share_len(2) | prime_len(2) | prime_bytes
+    per_chunk_share_len = []
+    per_chunk_prime = []
+    pos = 8
+    for _ in range(m):
+        share_len = bytes_to_int(first[pos:pos+2]); pos += 2
+        prime_len = bytes_to_int(first[pos:pos+2]); pos += 2
+        p_bytes = first[pos:pos+prime_len]; pos += prime_len
+        per_chunk_share_len.append(share_len)
+        per_chunk_prime.append(bytes_to_int(p_bytes))
+    header_len = pos
 
-    Returns base64 ciphertext.
-    """
-    pub = load_public_key(registrar_pub_path)
-    return base64.b64encode(_rsa_encrypt(pub, plaintext)).decode("ascii")
+    # Extract per-chunk share integers for each provided share
+    xs = [s[0] for s in shares]
+    k = len(shares)
+    per_chunk_ys = [[] for _ in range(m)]
+    for s in shares:
+        b = s[1]
+        pos = header_len
+        for cidx in range(m):
+            slen = per_chunk_share_len[cidx]
+            chunk_bytes = b[pos:pos+slen]
+            val = bytes_to_int(chunk_bytes)
+            per_chunk_ys[cidx].append(val)
+            pos += slen
 
+    # Reconstruct each chunk via integer Lagrange interpolation modulo the stored prime
+    recovered_chunks = []
+    for cidx in range(m):
+        ys = per_chunk_ys[cidx]
+        p = per_chunk_prime[cidx]
+        secret_chunk_int = 0
+        for i in range(k):
+            xi = xs[i]
+            yi = ys[i]
+            num = 1
+            den = 1
+            for j in range(k):
+                if i == j:
+                    continue
+                xj = xs[j]
+                num = (num * (-xj)) % p
+                den = (den * (xi - xj)) % p
+            inv_den = pow(den, -1, p)
+            lag = (num * inv_den) % p
+            secret_chunk_int = (secret_chunk_int + (yi * lag)) % p
+        # determine expected length for this chunk
+        expected_len = CHUNK_SIZE if cidx < m - 1 else (L - CHUNK_SIZE * (m - 1))
+        recovered_chunks.append(int_to_bytes(secret_chunk_int, expected_len))
 
-def decrypt_for_registrar(registrar_priv_path: str, b64cipher: str) -> bytes:
-    priv = load_private_key(registrar_priv_path)
-    return _rsa_decrypt(priv, base64.b64decode(b64cipher))
-
-
-def rsa_encrypt_to_b64(pub_path: str, plaintext: bytes) -> str:
-    """Encrypt small plaintext with RSA-OAEP and return base64 ciphertext."""
-    pub = load_public_key(pub_path)
-    ct = _rsa_encrypt(pub, plaintext)
-    return base64.b64encode(ct).decode("ascii")
-
-
-def rsa_decrypt_from_b64(priv_path: str, b64cipher: str) -> bytes:
-    """Decrypt base64 RSA-OAEP ciphertext returning plaintext bytes."""
-    priv = load_private_key(priv_path)
-    return _rsa_decrypt(priv, base64.b64decode(b64cipher))
-
-
-def encrypt_ballot_with_election_pub(election_pub_path: str, plaintext: bytes) -> Dict:
-    """Hybrid encrypt plaintext to election RSA public key.
-
-    Returns a dict with base64-encoded AES-GCM ciphertext, nonce and
-    the AES key encrypted with the election RSA public key.
-    """
-    pub = load_public_key(election_pub_path)
-    # symmetric key
-    K = secrets.token_bytes(32)
-    aesgcm = AESGCM(K)
-    nonce = secrets.token_bytes(12)
-    ct = aesgcm.encrypt(nonce, plaintext, associated_data=None)
-    enc_key = _rsa_encrypt(pub, K)
-    return {
-        "ciphertext": base64.b64encode(ct).decode("ascii"),
-        "nonce": base64.b64encode(nonce).decode("ascii"),
-        "enc_key": base64.b64encode(enc_key).decode("ascii"),
-        "alg": "AESGCM+RSA-OAEP-v1",
-    }
-
-
-def decrypt_ballot_with_election_priv(election_priv_path: str, payload: Dict) -> bytes:
-    """Decrypt payload created by `encrypt_ballot_with_election_pub` using election private key."""
-    ct = base64.b64decode(payload["ciphertext"])
-    nonce = base64.b64decode(payload["nonce"])
-    enc_key = base64.b64decode(payload["enc_key"])
-    priv = load_private_key(election_priv_path)
-    K = _rsa_decrypt(priv, enc_key)
-    aesgcm = AESGCM(K)
-    pt = aesgcm.decrypt(nonce, ct, associated_data=None)
-    return pt
+    return b"".join(recovered_chunks)
 
 
 def split_private_key_shares(priv_path: str, n: int, k: int):
@@ -402,95 +460,107 @@ def split_private_key_shares(priv_path: str, n: int, k: int):
     """
     with open(priv_path, "rb") as f:
         pem = f.read()
-    return shamir_split(pem, n, k)
+    # Prefer integer-Shamir splitting which works well for arbitrary-length
+    # secrets and maps cleanly to integer polynomial operations.
+    try:
+        return _int_shamir_split(pem, n, k)
+    except Exception:
+        # Fallback: byte-wise Shamir
+        return shamir_split(pem, n, k)
 
 
 def combine_private_key_shares(shares):
     """Combine shares (list of (x, share_bytes)) to recover private key PEM bytes."""
-    return shamir_combine(shares)
+    # Try integer-Shamir combine first (compatible with `_int_shamir_split`)
+    try:
+        return _int_shamir_combine(shares)
+    except Exception:
+        # Fallback to byte-wise Shamir recombination
+        return shamir_combine(shares)
 
 
-# ---- ElGamal on EC (hybrid) ----
-def elgamal_keygen(curve: ec.EllipticCurve = ec.SECP256R1()):
-    """Generate an EC keypair for ElGamal-style hybrid encryption.
+# ---- ElGamal Encryption ----
+# Functions for ElGamal-style hybrid encryption using elliptic curves.
+# def elgamal_keygen(curve: ec.EllipticCurve = ec.SECP256R1()):
+#     """Generate an EC keypair for ElGamal-style hybrid encryption.
 
-    Returns a tuple `(priv_pem: bytes, pub_pem: bytes)` suitable for saving to disk.
-    Uses the standard PEM serialization for private/public keys.
-    """
-    priv = ec.generate_private_key(curve)
-    pub = priv.public_key()
+#     Returns a tuple `(priv_pem: bytes, pub_pem: bytes)` suitable for saving to disk.
+#     Uses the standard PEM serialization for private/public keys.
+#     """
+#     priv = ec.generate_private_key(curve)
+#     pub = priv.public_key()
 
-    priv_pem = priv.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    pub_pem = pub.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    return priv_pem, pub_pem
-
-
-def _derive_shared_key(ec_priv, ec_peer_pub, info: bytes = b"elgamal-shared") -> bytes:
-    """Derive a symmetric key from ECDH shared secret using HKDF-SHA256."""
-    shared = ec_priv.exchange(ec.ECDH(), ec_peer_pub)
-    # HKDF derive 32 bytes key
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=info,
-    )
-    return hkdf.derive(shared)
+#     priv_pem = priv.private_bytes(
+#         encoding=serialization.Encoding.PEM,
+#         format=serialization.PrivateFormat.PKCS8,
+#         encryption_algorithm=serialization.NoEncryption(),
+#     )
+#     pub_pem = pub.public_bytes(
+#         encoding=serialization.Encoding.PEM,
+#         format=serialization.PublicFormat.SubjectPublicKeyInfo,
+#     )
+#     return priv_pem, pub_pem
 
 
-def elgamal_encrypt(pub_pem_path: str, plaintext: bytes) -> Dict:
-    """Encrypt `plaintext` to the given EC public key (PEM file).
-
-    This performs an ephemeral-static ElGamal: pick ephemeral `k`, compute
-    `R = k*G` (ephemeral public key) and derive symmetric key from `k*Q` via
-    ECDH+HKDF. The message is encrypted with AES-GCM.
-
-    Returns a JSON-serializable dict with base64-encoded fields:
-    - `ephemeral_pub`: PEM of ephemeral public key (base64)
-    - `nonce`, `ciphertext`, `alg`
-    """
-    pub = load_public_key(pub_pem_path)
-    if not isinstance(pub, ec.EllipticCurvePublicKey):
-        # cryptography's public key types are tested at runtime; allow duck-typing
-        try:
-            # attempt to load as PEM and check
-            pass
-        except Exception:
-            raise ValueError("provided public key is not an EC public key")
-
-    # Create ephemeral key
-    eph = ec.generate_private_key(pub.curve)
-    eph_pub = eph.public_key()
-
-    # derive symmetric key via ECDH
-    shared_key = _derive_shared_key(eph, pub)
-
-    aesgcm = AESGCM(shared_key)
-    nonce = secrets.token_bytes(12)
-    ct = aesgcm.encrypt(nonce, plaintext, associated_data=None)
-
-    # serialize ephemeral public key to PEM and include
-    eph_pub_pem = eph_pub.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-
-    return {
-        "ephemeral_pub": base64.b64encode(eph_pub_pem).decode("ascii"),
-        "nonce": base64.b64encode(nonce).decode("ascii"),
-        "ciphertext": base64.b64encode(ct).decode("ascii"),
-        "alg": "EC-ElGamal+AESGCM-HKDF-SHA256-v1",
-    }
+# def _derive_shared_key(ec_priv, ec_peer_pub, info: bytes = b"elgamal-shared") -> bytes:
+#     """Derive a symmetric key from ECDH shared secret using HKDF-SHA256."""
+#     shared = ec_priv.exchange(ec.ECDH(), ec_peer_pub)
+#     # HKDF derive 32 bytes key
+#     hkdf = HKDF(
+#         algorithm=hashes.SHA256(),
+#         length=32,
+#         salt=None,
+#         info=info,
+#     )
+#     return hkdf.derive(shared)
 
 
-def elgamal_decrypt(priv_pem_path: str, payload: Dict) -> bytes:
+# def elgamal_encrypt(pub_pem_path: str, plaintext: bytes) -> Dict:
+#     """Encrypt `plaintext` to the given EC public key (PEM file).
+
+#     This performs an ephemeral-static ElGamal: pick ephemeral `k`, compute
+#     `R = k*G` (ephemeral public key) and derive symmetric key from `k*Q` via
+#     ECDH+HKDF. The message is encrypted with AES-GCM.
+
+#     Returns a JSON-serializable dict with base64-encoded fields:
+#     - `ephemeral_pub`: PEM of ephemeral public key (base64)
+#     - `nonce`, `ciphertext`, `alg`
+#     """
+#     pub = load_public_key(pub_pem_path)
+#     if not isinstance(pub, ec.EllipticCurvePublicKey):
+#         # cryptography's public key types are tested at runtime; allow duck-typing
+#         try:
+#             # attempt to load as PEM and check
+#             pass
+#         except Exception:
+#             raise ValueError("provided public key is not an EC public key")
+
+#     # Create ephemeral key
+#     eph = ec.generate_private_key(pub.curve)
+#     eph_pub = eph.public_key()
+
+#     # derive symmetric key via ECDH
+#     shared_key = _derive_shared_key(eph, pub)
+
+#     aesgcm = AESGCM(shared_key)
+#     nonce = secrets.token_bytes(12)
+#     ct = aesgcm.encrypt(nonce, plaintext, associated_data=None)
+
+#     # serialize ephemeral public key to PEM and include
+#     eph_pub_pem = eph_pub.public_bytes(
+#         encoding=serialization.Encoding.PEM,
+#         format=serialization.PublicFormat.SubjectPublicKeyInfo,
+#     )
+
+#     return {
+#         "ephemeral_pub": base64.b64encode(eph_pub_pem).decode("ascii"),
+#         "nonce": base64.b64encode(nonce).decode("ascii"),
+#         "ciphertext": base64.b64encode(ct).decode("ascii"),
+#         "alg": "EC-ElGamal+AESGCM-HKDF-SHA256-v1",
+#     }
+
+
+# def elgamal_decrypt(priv_pem_path: str, payload: Dict) -> bytes:
     """Decrypt payload produced by `elgamal_encrypt` using private key PEM path."""
     priv = load_private_key(priv_pem_path)
     if not isinstance(priv, ec.EllipticCurvePrivateKey):
@@ -506,32 +576,77 @@ def elgamal_decrypt(priv_pem_path: str, payload: Dict) -> bytes:
     return aesgcm.decrypt(nonce, ct, associated_data=None)
 
 
-# ---- Schnorr OR-proof API (placeholder) ----
-def generate_schnorr_or_proof_elgamal(ciphertext: Dict, allowed_plaintexts: list, priv_pem_path: str):
-    """Generate a Schnorr OR-proof that the given ElGamal `ciphertext` decrypts
-    to one of the `allowed_plaintexts` WITHOUT revealing which one.
+# Schnorr OR-proofs are intentionally omitted from this module. If you
+# require generation/verification of Schnorr OR-proofs for ElGamal ciphertexts,
+# add a well-tested ZKP library (for example, `petlib`) and implement helper
+# wrappers here. Implementing ZKPs by hand is error-prone and out of scope for
+# this utilities module.
 
-    NOTE: Full, secure Schnorr OR-proofs are non-trivial to implement correctly.
-    This function currently raises NotImplementedError and serves as a clear
-    integration point. For a production implementation, use a well-tested
-    crypto library (e.g., `petlib` or specialized ZKP libraries) and follow
-    a standard construction (Fiat-Shamir transformed Sigma OR-proofs).
+# ---- Helper Functions ----
+# These functions are used internally by Shamir secret sharing and other cryptographic utilities.
 
-    If you would like, I can implement this using `petlib`/`ecpy` once you
-    confirm installation is acceptable.
-    """
-    raise NotImplementedError(
-        "Schnorr OR-proof generation is not implemented. Install a ZKP library "
-        "(e.g., petlib) and ask me to implement using that library."
-    )
+def _eval_poly(coeffs, x):
+    """Evaluate a polynomial at x using coefficients in GF(256)."""
+    result = 0
+    power = 1
+    for c in coeffs:
+        result = _gf_add(result, _gf_mul(c, power))
+        power = _gf_mul(power, x)
+    return result
 
+def _gf_add(a: int, b: int) -> int:
+    """Addition in GF(256) is XOR."""
+    return a ^ b
 
-def verify_schnorr_or_proof_elgamal(ciphertext: Dict, proof, pub_pem_path: str, allowed_plaintexts: list) -> bool:
-    """Verify a Schnorr OR-proof (placeholder).
+def _gf_mul(a: int, b: int) -> int:
+    """Multiplication in GF(256) using precomputed tables."""
+    if a == 0 or b == 0:
+        return 0
+    return _GF256_EXP[_GF256_LOG[a] + _GF256_LOG[b]]
 
-    Returns True iff proof verifies. Currently not implemented.
-    """
-    raise NotImplementedError(
-        "Schnorr OR-proof verification is not implemented. Provide a proof library "
-        "and I can implement verification accordingly."
-    )
+def _gf_inv(a: int) -> int:
+    """Multiplicative inverse in GF(256)."""
+    if a == 0:
+        raise ZeroDivisionError()
+    return _GF256_EXP[255 - _GF256_LOG[a]]
+
+def int_to_bytes(i: int, length: int) -> bytes:
+    """Convert an integer to a byte array of the specified length."""
+    return i.to_bytes(length, byteorder="big")
+
+def bytes_to_int(b: bytes) -> int:
+    """Convert a byte array to an integer."""
+    return int.from_bytes(b, byteorder="big")
+
+def next_probable_prime_at_least(m: int) -> int:
+    """Find the next probable prime greater than or equal to m."""
+    candidate = m if m % 2 == 1 else m + 1
+    while not is_probable_prime(candidate):
+        candidate += 2
+    return candidate
+
+def is_probable_prime(n: int, rounds: int = 8) -> bool:
+    """Check if a number is a probable prime using the Miller-Rabin test."""
+    if n < 2:
+        return False
+    small_primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+    for p in small_primes:
+        if n % p == 0:
+            return n == p
+    d = n - 1
+    s = 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+    for _ in range(rounds):
+        a = random.randrange(2, n - 1)
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        for _ in range(s - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True

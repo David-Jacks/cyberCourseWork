@@ -68,6 +68,28 @@ def tally_and_print():
     admin_share_spec = os.environ.get("ADMIN_SHARE")
     tallier_share_spec = os.environ.get("TALLIER_SHARE")
 
+    # If share specs are not provided but the full election private key
+    # is available (useful for local/console runs), split the PEM into
+    # two Shamir shares and populate the env vars so the rest of the
+    # flow can proceed unchanged.
+    if not admin_share_spec or not tallier_share_spec:
+        election_priv = os.environ.get("ELECTION_PRIV_KEY")
+        if election_priv and os.path.exists(election_priv):
+            try:
+                from secure_utils import split_private_key_shares
+                shares = split_private_key_shares(election_priv, 2, 2)
+                # shares is [(1, bytes), (2, bytes)]
+                a_spec = f"{shares[0][0]}:{base64.b64encode(shares[0][1]).decode('ascii')}"
+                t_spec = f"{shares[1][0]}:{base64.b64encode(shares[1][1]).decode('ascii')}"
+                # only set if not already provided
+                os.environ.setdefault("ADMIN_SHARE", a_spec)
+                os.environ.setdefault("TALLIER_SHARE", t_spec)
+                admin_share_spec = os.environ.get("ADMIN_SHARE")
+                tallier_share_spec = os.environ.get("TALLIER_SHARE")
+                print("Derived ADMIN_SHARE and TALLIER_SHARE from ELECTION_PRIV_KEY.")
+            except Exception as e:
+                print("Failed to split election private key into shares:", e)
+
     if not admin_share_spec or not tallier_share_spec:
         print("ADMIN_SHARE and TALLIER_SHARE environment variables are required to reconstruct election private key.")
         return

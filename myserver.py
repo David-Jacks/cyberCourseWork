@@ -70,7 +70,7 @@ ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 # available they will be used; otherwise the server falls back to the
 # original behaviour (no verification/encryption).
 try:
-    from secure_utils import hash_id, verify_ed25519, rsa_decrypt_from_b64, decrypt_ballot_with_election_priv, encrypt_for_registrar
+    from secure_utils import hash_id, verify_ed25519, rsa_decrypt_from_b64, encrypt_for_registrar
 except Exception:
     hash_id = None
     verify_ed25519 = None
