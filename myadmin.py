@@ -1,67 +1,8 @@
-import sys
 import requests
 from typing import Optional
 import os
 import base64
-import json
-
-
-def _maybe_load_keys_env():
-    # Load canonical `keys.env` as specified in system design.
-    env_dir = os.path.join(os.path.dirname(__file__), "keys")
-    env_path = os.path.join(env_dir, "keys.env")
-    if not os.path.exists(env_path):
-        return
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(dotenv_path=env_path)
-        return
-    except Exception:
-        pass
-    try:
-        with open(env_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                v = v.strip().strip('"').strip("'")
-                os.environ.setdefault(k.strip(), v)
-    except Exception:
-        pass
-
-
-_maybe_load_keys_env()
-
-# Optional signing helper (Ed25519). If `ADMIN_PRIV_KEY` env var is set and
-# a key is available, admin commands will be signed and the signature sent
-# in `X-Signature` header so the server can verify the admin request.
-try:
-    from secure_utils import sign_ed25519
-except Exception:
-    sign_ed25519 = None
-
-#!/usr/bin/env python3
-"""
-myadmin.py
-
-Simple admin client to open/close an election by sending HTTP requests
-to a server running on localhost:5000.
-
-Endpoints used (examples — adapt to your server API):
-- POST /election/open        -> open the voting (no body required)
-- POST /election/close       -> close the voting (no body required)
-- GET  /election/state       -> query current voting state
-
-Each function below documents the endpoint it uses.
-"""
-
-
-BASE_URL = "http://localhost:5000"
-DEFAULT_TIMEOUT = 5.0
-
+from my_utils import DEFAULT_HOST, DEFAULT_TIMEOUT, _maybe_load_keys_env, sign_ed25519
 
 def _parse_response(resp):
     """Return parsed JSON when Content-Type is JSON, otherwise plain text.
@@ -90,13 +31,16 @@ def open_election(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
 
     Returns: parsed JSON response on success, None on failure.
     """
-    url = f"{BASE_URL}/election/open"
+    url = f"{DEFAULT_HOST}/election/open"
     # Sign the command if an admin key is configured; the server will verify
     # the signature if it has the corresponding public key configured.
     headers = {}
     # Prefer explicit admin signing key
-    keypath = os.environ.get("ADMIN_SIGN_PRIV_KEY") or os.environ.get("ADMIN_PRIV_KEY") or os.environ.get("ADMIN_ENC_PRIV_KEY")
+    
+    keypath = os.environ.get("ADMIN_SIGN_PRIV_KEY")
+
     body = b""  # no body for this endpoint in current design
+
     if keypath and sign_ed25519 is not None:
         try:
             sig = sign_ed25519(keypath, body)
@@ -104,11 +48,6 @@ def open_election(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
             headers["X-Signer"] = "admin"
         except Exception as e:
             print("warning: admin signing failed:", e)
-
-    # If an admin secret is configured, include it in the request headers
-    admin_secret = os.environ.get("ADMIN_SECRET")
-    if admin_secret:
-        headers["X-Admin-Secret"] = admin_secret
 
     try:
         resp = requests.post(url, timeout=timeout, headers=headers)
@@ -124,14 +63,14 @@ def close_election(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
     Close the election.
 
     Endpoint used:
-    POST {BASE_URL}/election/close
+    POST {DEFAULT_HOST}/election/close
     Purpose: instructs the server to transition the election into the 'closed' state.
 
     Returns: parsed JSON response on success, None on failure.
     """
-    url = f"{BASE_URL}/election/close"
+    url = f"{DEFAULT_HOST}/election/close"
     headers = {}
-    keypath = os.environ.get("ADMIN_SIGN_PRIV_KEY") or os.environ.get("ADMIN_PRIV_KEY") or os.environ.get("ADMIN_ENC_PRIV_KEY")
+    keypath = os.environ.get("ADMIN_SIGN_PRIV_KEY")
     body = b""
     if keypath and sign_ed25519 is not None:
         try:
@@ -141,17 +80,13 @@ def close_election(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
         except Exception as e:
             print("warning: admin signing failed:", e)
 
-    admin_secret = os.environ.get("ADMIN_SECRET")
-    if admin_secret:
-        headers["X-Admin-Secret"] = admin_secret
-
     try:
         resp = requests.post(url, timeout=timeout, headers=headers)
         resp.raise_for_status()
         return _parse_response(resp)
     except Exception as e:
         print(f"close_election error: {e}")
-        return None
+        return
 
 
 
@@ -165,7 +100,7 @@ def get_election_state(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
 
     Returns: parsed JSON response on success, None on failure.
     """
-    url = f"{BASE_URL}/election/state"
+    url = f"{DEFAULT_HOST}/election/state"
     try:
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
@@ -177,25 +112,31 @@ def get_election_state(timeout: float = DEFAULT_TIMEOUT) -> Optional[object]:
 
 
 def admin_main():
-    print("You are now logged in as admin.")
-    print("1. Open election")
-    print("2. Close election")
-    print("3. Check election status")
-    print("4. exit")
-    adminChoice = input("Please make a choice: ").strip() 
+    #load keys
+    _maybe_load_keys_env()
+    print("\nLogged into admin portal.\n")
 
-    if adminChoice == "1":
-        result = open_election()
-        print("open:", result)
-    elif adminChoice == "2":
-        result = close_election()
-        print("close:", result)
-    elif adminChoice == "3":
-        result = get_election_state()
-        print("status:", result)
-    elif adminChoice == "4":
-        return
-    else:
-        print("Invalid choice. Please try again.")
-        return
-    
+    adminChoice = ""
+    while adminChoice != "4":
+        print("1. Open election")
+        print("2. Close election")
+        print("3. Check election status")
+        print("4. exit")
+
+        adminChoice = input("Please make a choice: ").strip() 
+
+        if adminChoice == "1":
+            result = open_election()
+            print("open:", result)
+        elif adminChoice == "2":
+            result = close_election()
+            print("close:", result)
+        elif adminChoice == "3":
+            result = get_election_state()
+            print("status:", result)
+        elif adminChoice == "4":
+            print("Logged Out.")
+            return
+        else:
+            print("Invalid choice. Please try again.")
+        

@@ -1,51 +1,14 @@
-#!/usr/bin/env python3
-"""Tallier: fetch ballots after election closed, compute tally and print results.
-
-This script expects the server to expose GET /ballots which returns
-{"ballots": [{"voter_id":..., "choice":...}, ...]}
-"""
-BASE_URL = "http://localhost:5000"
-
 import requests
 from collections import Counter
 import os
 import json
 import base64
-
-
-def _maybe_load_keys_env():
-    # Load canonical `keys.env` as specified in system design.
-    env_dir = os.path.join(os.path.dirname(__file__), "keys")
-    env_path = os.path.join(env_dir, "keys.env")
-    if not os.path.exists(env_path):
-        return
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(dotenv_path=env_path)
-        return
-    except Exception:
-        pass
-    try:
-        with open(env_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                v = v.strip().strip('"').strip("'")
-                os.environ.setdefault(k.strip(), v)
-    except Exception:
-        pass
-
-
-_maybe_load_keys_env()
-
-
+from my_utils import DEFAULT_HOST, decrypt_ballot_with_election_priv
+from my_sss import combine_private_key_shares
+import tempfile
 
 def fetch_ballots():
-    url = f"{BASE_URL}/ballots"
+    url = f"{DEFAULT_HOST}/ballots"
     resp = requests.get(url, timeout=5)
     resp.raise_for_status()
     data = resp.json()
@@ -53,49 +16,23 @@ def fetch_ballots():
 
 
 def tally_and_print():
+
     ballots = fetch_ballots()
+
     if not ballots:
         print("no ballots found")
-        return
+        return None
 
-   
-    # For this design we expect ballots to be encrypted with the ELECTION
-    # public key. The election private key must be reconstructed via
-    # Shamir secret sharing from trustee shares (admin+tallier). The
-    # environment variables `ADMIN_SHARE` and `TALLIER_SHARE` are expected
-    # to contain share spec strings in the form `x:BASE64` (or path to a
-    # file containing that string). Two shares (threshold=2) are required.
+
+    #hetting the shares from the admin and tallier for decrypting ballots
     admin_share_spec = os.environ.get("ADMIN_SHARE")
     tallier_share_spec = os.environ.get("TALLIER_SHARE")
-
-    # If share specs are not provided but the full election private key
-    # is available (useful for local/console runs), split the PEM into
-    # two Shamir shares and populate the env vars so the rest of the
-    # flow can proceed unchanged.
-    if not admin_share_spec or not tallier_share_spec:
-        election_priv = os.environ.get("ELECTION_PRIV_KEY")
-        if election_priv and os.path.exists(election_priv):
-            try:
-                from secure_utils import split_private_key_shares
-                shares = split_private_key_shares(election_priv, 2, 2)
-                # shares is [(1, bytes), (2, bytes)]
-                a_spec = f"{shares[0][0]}:{base64.b64encode(shares[0][1]).decode('ascii')}"
-                t_spec = f"{shares[1][0]}:{base64.b64encode(shares[1][1]).decode('ascii')}"
-                # only set if not already provided
-                os.environ.setdefault("ADMIN_SHARE", a_spec)
-                os.environ.setdefault("TALLIER_SHARE", t_spec)
-                admin_share_spec = os.environ.get("ADMIN_SHARE")
-                tallier_share_spec = os.environ.get("TALLIER_SHARE")
-                print("Derived ADMIN_SHARE and TALLIER_SHARE from ELECTION_PRIV_KEY.")
-            except Exception as e:
-                print("Failed to split election private key into shares:", e)
 
     if not admin_share_spec or not tallier_share_spec:
         print("ADMIN_SHARE and TALLIER_SHARE environment variables are required to reconstruct election private key.")
         return
 
     def _load_share(spec: str):
-        # spec may be 'x:BASE64' or a path to a file with that content
         try:
             if os.path.exists(spec):
                 with open(spec, "r") as f:
@@ -113,12 +50,6 @@ def tally_and_print():
         print("Failed to parse share specs. Expected 'x:BASE64' or path to file containing it.")
         return
 
-    try:
-        from secure_utils import combine_private_key_shares, decrypt_ballot_with_election_priv
-    except Exception:
-        print("required secure_utils helpers not available")
-        return
-
     # Reconstruct election private key PEM bytes
     try:
         pem = combine_private_key_shares([s_admin, s_tall])
@@ -126,8 +57,7 @@ def tally_and_print():
         print("failed to combine shares:", e)
         return
 
-    # Write reconstructed PEM to a temporary file to use decryption helper
-    import tempfile
+    # Putting the key in a temporal file so that i can use my decryption function on it.
     tf = tempfile.NamedTemporaryFile(delete=False)
     try:
         tf.write(pem)
@@ -149,25 +79,46 @@ def tally_and_print():
         else:
             decrypted_choices.append(b.get("choice"))
 
-    # Determine winner (most common choice) but do NOT reveal counts
-    # or any mapping to voters. If there is a tie we list tied options.
+    # I a determining a winner as the most common choice, without revealing counts
+    # or any mapping to voters. If there is a tie I will list the tied options.
     counts = Counter([c for c in decrypted_choices if c is not None])
     if not counts:
         print("no valid votes decrypted")
-        return
+        # cleanup temporary key file
+        try:
+            os.unlink(priv_path)
+        except Exception:
+            pass
+        return None
 
     most = counts.most_common()
     top_count = most[0][1]
     winners = [choice for choice, cnt in most if cnt == top_count]
 
     if len(winners) == 1:
-        print("Election winner:", winners[0])
+        print("Election completed, hence, the summer vation will be at ", winners[0])
     else:
-        print("Election winners (tie):", ", ".join(winners))
+        print("Election Completed, but we have a tie:", ", ".join(winners))
+
+    # Prepare a structured result for programmatic consumption
+    result = {
+        "counts": dict(counts),
+        "winners": winners,
+        "top_count": top_count,
+        "num_ballots": len(ballots),
+    }
+
+    # cleanup temporary key file
+    try:
+        os.unlink(priv_path)
+    except Exception:
+        pass
+
+    return result
 
 
 def tally_main():
-    print("\nLogged in as Tallier.\n")
+    print("\nPlease wait......\n")
     try:
         tally_and_print()
     except requests.HTTPError as he:

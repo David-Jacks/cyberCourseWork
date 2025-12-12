@@ -1,56 +1,15 @@
+import os
 import json
 import sys
 import requests
-import myregistrar
-import myadmin
-import mytallier
-import os
-try:
-    from secure_utils import hash_id
-except Exception:
-    hash_id = None
+import re
+from my_utils import DEFAULT_HOST, DEFAULT_TIMEOUT, encrypt_ballot_with_election_pub, rsa_encrypt_to_b64, hash_id, _maybe_load_keys_env
+from Schnorr_ZKP import voter_generate_proof, serialize_proof
+from myregistrar import add_voter
+from mytallier import tally_main
 
 
-def _maybe_load_keys_env():
-    # Load canonical `keys.env` as specified in system design.
-    env_dir = os.path.join(os.path.dirname(__file__), "keys")
-    env_path = os.path.join(env_dir, "keys.env")
-    if not os.path.exists(env_path):
-        return
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(dotenv_path=env_path)
-        return
-    except Exception:
-        pass
-    try:
-        with open(env_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                v = v.strip().strip('"').strip("'")
-                os.environ.setdefault(k.strip(), v)
-    except Exception:
-        pass
-
-
-_maybe_load_keys_env()
-
-#!/usr/bin/env python3
-"""
-Simple HTTP GET client for http://localhost:5000
-Sends a GET request to the given path (default "/") and prints status, headers, and body.
-"""
-
-
-DEFAULT_HOST = "http://localhost:5000"
-
-
-def get(url: str, timeout: float = 5.0):
+def get(url: str, timeout: float = DEFAULT_TIMEOUT):
     headers = {"Accept": "*/*", "User-Agent": "myclient/1.0"}
     try:
         resp = requests.get(url, headers=headers, timeout=timeout)
@@ -75,11 +34,10 @@ def get(url: str, timeout: float = 5.0):
     return {"status": status, "headers": headers, "body": body}
 
 
-def check_state(timeout: float = 5.0):
+def check_state(timeout: float = DEFAULT_TIMEOUT):
     """Return the current election state as a string ('open' or 'closed'), or None on error."""
     try:
         res = get(DEFAULT_HOST + "/election/state", timeout=timeout)
-        # res['body'] is pretty-printed JSON when available
         try:
             parsed = json.loads(res["body"])
             return parsed.get("state")
@@ -89,7 +47,7 @@ def check_state(timeout: float = 5.0):
         return None
 
 
-def get_options(timeout: float = 5.0):
+def get_options(timeout: float = DEFAULT_TIMEOUT):
     """Fetch configured options; return list or None on error."""
     try:
         res = get(DEFAULT_HOST + "/options", timeout=timeout)
@@ -102,7 +60,7 @@ def get_options(timeout: float = 5.0):
         return None
 
 
-def submit_ballot(voter_id: str, choice: str, timeout: float = 5.0):
+def submit_ballot(voter_id: str, choice: str, timeout: float = DEFAULT_TIMEOUT, voter_secret: str = None):
     """Submit a ballot. Returns (status_code, text) or raises requests.RequestException."""
     # Require `ELECTION_PUB_KEY` and `SERVER_PUB_KEY` to be configured
     # per design: ballots are encrypted with the election public key and
@@ -111,12 +69,8 @@ def submit_ballot(voter_id: str, choice: str, timeout: float = 5.0):
     server_pub = os.environ.get("SERVER_PUB_KEY")
 
     if not election_pub or not server_pub or hash_id is None:
-        raise RuntimeError("Missing ELECTION_PUB_KEY, SERVER_PUB_KEY or hashing support; refusing to send raw identifiers per policy")
-
-    try:
-        from secure_utils import encrypt_ballot_with_election_pub, rsa_encrypt_to_b64
-    except Exception:
-        raise RuntimeError("Required crypto helpers not available in secure_utils")
+        print("Missing ELECTION_PUB_KEY, SERVER_PUB_KEY or hashing support")
+        return
 
     voter_hash = hash_id(voter_id)
     # Encrypt hashed id to server
@@ -126,30 +80,50 @@ def submit_ballot(voter_id: str, choice: str, timeout: float = 5.0):
     plaintext = json.dumps(ballot).encode("utf-8")
     enc_ballot = encrypt_ballot_with_election_pub(election_pub, plaintext)
     payload = {"enc_voter_hash": enc_voter_hash, "encrypted_ballot": enc_ballot}
+    # Schnorr proof (optional): include proof if Schnorr group configured
+    # Ensure any keys/env written by the registrar (keys/keys.env) are loaded
+    try:
+        _maybe_load_keys_env()
+    except Exception:
+        pass
+
+    try:
+        p = os.environ.get("SCHNORR_P")
+        q = os.environ.get("SCHNORR_Q")
+        g = os.environ.get("SCHNORR_G")
+        if p and q and g:
+            p_i = int(p)
+            q_i = int(q)
+            g_i = int(g)
+            # obtain secret (either passed in or prompt)
+            if voter_secret is None:
+                try:
+                    voter_secret = input("Enter your 3-digit secret: ").strip()
+                except Exception:
+                    voter_secret = None
+            if voter_secret is not None:
+                x = int(voter_secret)
+                proof = voter_generate_proof(x, p_i, q_i, g_i, message=voter_hash.encode("utf-8"))
+                t_hex, c_hex, s_hex, h_hex = serialize_proof(proof)
+                payload["proof"] = {"t": t_hex, "c": c_hex, "s": s_hex, "h": h_hex}
+    except Exception:
+        pass
     resp = requests.post(DEFAULT_HOST + "/vote", json=payload, timeout=timeout)
     return resp.status_code, resp.text
 
-    # Validate voter id locally if a regex is configured (server will
-    # enforce it too). This reduces obvious mistakes before sending.
-    import re
-    id_re = os.environ.get("STUDENT_ID_REGEX")
-    if id_re and not re.match(id_re, str(voter_id)):
-        raise ValueError("invalid voter_id format")
 
-    # Fallback: send unhashed voter_id (existing behaviour) - servers may
-    # NOTE: code flow should not reach here; submission returns earlier.
-    raise RuntimeError("unexpected fallback - ballot not submitted")
+def _cast_vote(timeout: float = DEFAULT_TIMEOUT, regex_ref = None):
+    print("\nLogged in as Student.\n")
 
-
-def sys_stater(timeout: float = 5.0):
-    """Interactive flow: check state, list options, prompt voter, and submit ballot."""
     # Check election state first
     state = check_state(timeout=timeout)
+
     if state is None:
         print("Could not determine election state.")
         return
     if state != "open":
         print(f"Election is not open for voting. Current state: {state} please contact admin.")
+        print("\nLogged Out.")
         return
 
     opts = get_options(timeout=timeout)
@@ -165,8 +139,11 @@ def sys_stater(timeout: float = 5.0):
         print(f"  {i}. {o}")
 
     voter_id = input("Voter ID: ").strip()
-    if not voter_id:
-        print("Voter ID required")
+    # ensure a usable regex is available
+    if regex_ref is None:
+        regex_ref = re.compile(r"^[0-9]{8}$")
+    if not voter_id or regex_ref.match(voter_id) is None:
+        print("Voter ID required or invalid format.")
         return
 
     choice_in = input("Enter choice (number): ").strip()
@@ -174,18 +151,28 @@ def sys_stater(timeout: float = 5.0):
         print("Choice required")
         return
 
-    # resolve choice
-    
-    idx = int(choice_in)
+    try:
+        idx = int(choice_in)
+    except ValueError:
+        print("Invalid choice number")
+        return
+
     if 1 <= idx <= len(opts):
         choice = opts[idx - 1]
     else:
         print("Invalid choice number")
         return
-  
 
     try:
-        status_code, text = submit_ballot(voter_id, choice, timeout=timeout)
+        # Prompt for the short secret token so the client always asks the voter
+        try:
+            voter_secret = input("Enter your 3-digit secret : ").strip()
+        except Exception:
+            voter_secret = None
+        if voter_secret == "":
+            voter_secret = None
+
+        status_code, text = submit_ballot(voter_id, choice, timeout=timeout, voter_secret=voter_secret)
         print(f"{status_code}")
         print(text)
     except requests.RequestException as e:
@@ -193,43 +180,42 @@ def sys_stater(timeout: float = 5.0):
         return
 
 
-def main():
-    timeout = 5.0
-    # check if the client is connected to the server
-    if get(DEFAULT_HOST, timeout=timeout) is None:
-        print("The Voting server is not running @", DEFAULT_HOST)
-        sys.exit(2)
-    print("Electronic voting system connected to -", DEFAULT_HOST)
-    print("Please Login")
-    print("1. Student")
-    print("2. Admin")
-    print("3. Tallier")
-    print("4. Registrar")
-    print("Enter X to close")
-    userinput = input("Please make a choice: ").strip()  
-    while userinput != "X":
-        
-        if userinput == "1":
-            print("\nLogged in as Student.")
-            sys_stater(timeout=timeout)
-        elif userinput == "2":
-            myadmin.admin_main()
-        elif userinput == "3":
-            mytallier.tally_main()
-        elif userinput == "4":
-            myregistrar.reg_main()
+def voting_client(timeout: float = DEFAULT_TIMEOUT):
+    """Interactive voting client for students."""
+
+    id_regex = re.compile(r"^[0-9]{8}$")
+
+    print("\nStudent Menu\n")
+    print("1. Register")
+    print("2. Cast Vote")
+    print("3. See Election Results")
+    print("Enter B to go back")
+    stud_choice = input("Please make a choice: ").strip()
+    while stud_choice.upper() != "B":
+        if stud_choice == "1":
+            voter_id = input("Enter voter ID: ")
+            name = input("Enter voter name: ")
+            if id_regex.match(voter_id) is None:
+                print("Invalid voter ID format.")
+                return
+            try:
+                #calling the add_voter function from myregistrar to register a new student
+                add_voter(voter_id, name)
+            except requests.HTTPError as he:
+                print("HTTP error:", he.response.status_code, he.response.text)
+            except Exception as e:
+                print("error:", e)
+        elif stud_choice == "2":
+            _cast_vote(timeout=timeout)
+        elif stud_choice == "3":
+            tally_main()
         else:
             print("Invalid choice. Please try again.")
 
-        print("\n-----------------\n")
-        print("Please Login")
-        print("1. Student")
-        print("2. Admin")
-        print("3. Tallier")
-        print("4. Registrar")
-        print("Enter X to close")
-        userinput = input("Please make a choice: ").strip()  
+        print("\nStudent Menu")
+        print("1. Register")
+        print("2. Cast Vote")
+        print("3. See Election Results")
+        print("Enter B to go back")
+        stud_choice = input("Please make a choice: ").strip()
 
-
-if __name__ == "__main__":
-    main()

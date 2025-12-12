@@ -1,99 +1,29 @@
-#!/usr/bin/env python3
-"""Simplified HTTP server with a thread-safe election state.
-
-This file provides a minimal, easy-to-read implementation that keeps the
-original behavior:
-
-- GET /             -> plain text greeting
-- GET /election/state -> JSON {"state": "open"|"closed"}
-- POST /election/open  -> set state to "open" (text response)
-- POST /election/close -> set state to "closed" (text response)
-- POST /election/state -> set state via JSON payload {"state": "open"}
-
-The original code used a subclass hook to inject endpoints; here we implement
-the handler directly for clarity.
-"""
-
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import signal
 import sys
 import json
 import threading
 import os
 import base64
-
-
-def _maybe_load_keys_env():
-    # Load the required `keys.env` (single canonical file per design)
-    env_dir = os.path.join(os.path.dirname(__file__), "keys")
-    env_path = os.path.join(env_dir, "keys.env")
-    if not os.path.exists(env_path):
-        return
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(dotenv_path=env_path)
-        return
-    except Exception:
-        pass
-    # Fallback simple parser (KEY=VALUE lines)
-    try:
-        with open(env_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                v = v.strip().strip('"').strip("'")
-                os.environ.setdefault(k.strip(), v)
-    except Exception:
-        pass
+from my_utils import hash_id, verify_ed25519, rsa_decrypt_from_b64, rsa_encrypt_to_b64, encrypt_for_registrar, _maybe_load_keys_env
+from my_sss import split_private_key_shares
+from Schnorr_ZKP import deserialize_proof, voter_verify_proof, voter_secret_key, voter_public_key, generate_group
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
 _maybe_load_keys_env()
 
-# Runtime configuration: student ID regex and admin secret
-# - `STUDENT_ID_REGEX` can be set in environment to enforce allowed ID pattern
-#   and make guessing attacks harder. Default is one example format.
-STUDENT_ID_REGEX = os.environ.get("STUDENT_ID_REGEX", r"^[A-Z]{2}[0-9]{6}$")
-import re
-_ID_PATTERN = re.compile(STUDENT_ID_REGEX)
-
-# Optional admin pre-shared secret (if set on the server, admin clients must
-# provide the same secret via the `X-Admin-Secret` header). This is separate
-# from the admin signing key and provides an additional authentication factor
-# for critical operations (open/close).
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
-
-# Optional secure helpers. If `cryptography` and `secure_utils.py` are
-# available they will be used; otherwise the server falls back to the
-# original behaviour (no verification/encryption).
-try:
-    from secure_utils import hash_id, verify_ed25519, rsa_decrypt_from_b64, encrypt_for_registrar
-except Exception:
-    hash_id = None
-    verify_ed25519 = None
-    rsa_decrypt_from_b64 = None
-    decrypt_ballot_with_election_priv = None
-    encrypt_for_registrar = None
-
-# Public key paths (signing). Server/private key path for decrypting hashed IDs.
+# Getting the needed shared public keys the server will need need to verify the identity if the users
 REGISTRAR_SIGN_PUB = os.environ.get("REGISTRAR_SIGN_PUB_KEY")
 ADMIN_SIGN_PUB = os.environ.get("ADMIN_SIGN_PUB_KEY")
 TALLIER_SIGN_PUB = os.environ.get("TALLIER_SIGN_PUB_KEY")
-SERVER_PRIV = os.environ.get("SERVER_PRIV_KEY")
 ELECTION_PUB = os.environ.get("ELECTION_PUB_KEY")
 REGISTRAR_ENC_PUB = os.environ.get("REGISTRAR_ENC_PUB_KEY")
 
+# this is the servers own private key, that it uses to decrypt encrypted messages sent over the network
+SERVER_PRIV = os.environ.get("SERVER_PRIV_KEY")
 
+#this is the electionstate class to manage the election
 class ElectionState:
-    """Thread-safe storage for the election state.
-
-    Only two values are allowed: "open" and "closed". Access is protected by
-    a Lock so the state can be safely read/written from multiple threads.
-    """
-
     def __init__(self, initial="closed"):
         self._state = initial
         self._lock = threading.Lock()
@@ -113,10 +43,9 @@ class ElectionState:
 election = ElectionState()
 
 
-# In-memory storage for voters, options and ballots
-# - `voters`: map voter_id -> name
-# - `options`: list of up to 4 location strings
-# - `ballots`: list of dicts {"voter_id":..., "choice":...}
+# - voters: map voter_id -> name
+# - options: list of up to 4 location strings
+# - ballots: list of dicts {"voter_id":..., "choice":...}
 # Access to these structures should be thread-safe; reuse a lock used by
 # ElectionState for simplicity (we can use a separate lock if desired).
 voters = {}
@@ -124,24 +53,29 @@ options = ["Paris", "Rome", "Bahamas", "Lisbon"]
 ballots = []
 storage_lock = threading.Lock()
 
-# Optional student database (list of allowed student identifiers). If
-# `STUDENT_DB_FILE` env var is set it should point to a file with one
-# student identifier per line; the server will store the hashed values
-# (using `hash_id`) for membership checks.
+# getting the list of valid students from the my_db.JSON file
 student_db = set()
-db_file = os.environ.get("STUDENT_DB_FILE")
-if db_file and os.path.exists(db_file):
+db_path = "my_db.JSON"
+if os.path.exists(db_path):
     try:
-        with open(db_file, "r") as f:
-            for line in f:
-                s = line.strip()
-                if not s:
+        with open(db_path, 'r', encoding='utf-8') as f:
+            j = json.load(f)
+
+        students = j.get('students', [])
+        if not isinstance(students, list):
+            student_db = set()
+        else:
+            for entry in students:
+                if not isinstance(entry, dict):
                     continue
-                if hash_id is not None:
-                    student_db.add(hash_id(s))
-                else:
-                    student_db.add(s)
+                if entry.get('hashed_id'):
+                    student_db.add(entry['hashed_id'])
+                elif entry.get('id'):
+                    raw = str(entry['id']).strip()
+                    if raw:
+                        student_db.add(hash_id(raw) if hash_id is not None else raw)
     except Exception:
+        print("Student db not connected")
         student_db = set()
 
 
@@ -168,9 +102,10 @@ def send_text(handler, text, status=200):
 class reqHandler(BaseHTTPRequestHandler):
     """HTTP request handler with explicit api endpoints."""
 
+    #this hanles all get requests that comes to the server
     def do_GET(self):
         # Root greeting
-        if self.path in ("/", "/index"):
+        if self.path in ("/"):
             send_text(self, "Voting Server is running on port 5000\n", status=200)
             return
 
@@ -185,7 +120,12 @@ class reqHandler(BaseHTTPRequestHandler):
             # Return hashed voter identifiers and encrypted names. The
             # server never exposes raw voter_id values in production.
             with storage_lock:
-                vlist = [{"voter_hash": vid, "enc_name": name} for vid, name in voters.items()]
+                    vlist = []
+                    for vid, val in voters.items():
+                        if isinstance(val, dict):
+                            vlist.append({"voter_hash": vid, "enc_name": val.get("enc_name")})
+                        else:
+                            vlist.append({"voter_hash": vid, "enc_name": val})
             send_json(self, {"voters": vlist})
             return
 
@@ -217,7 +157,31 @@ class reqHandler(BaseHTTPRequestHandler):
                 except Exception:
                     send_text(self, "invalid signature format\n", status=403)
                     return
-
+            #i want to divide the the keys among the admin and tallier, before election can be tallyed
+            election_priv = os.environ.get("ELECTION_PRIV_KEY")
+            if election_priv and os.path.exists(election_priv):
+                try:
+                    shares = split_private_key_shares(election_priv, n=3, k=2)
+                    # Do not print raw share bytes (sensitive). Log indices only.
+                    try:
+                        idxs = [s[0] for s in shares]
+                        print(f"Derived share indices: {idxs}", flush=True)
+                    except Exception:
+                        pass
+                    # shares is [(1, bytes), (2, bytes),(3, bytes)]
+                    a_spec = f"{shares[0][0]}:{base64.b64encode(shares[0][1]).decode('ascii')}"
+                    t_spec = f"{shares[1][0]}:{base64.b64encode(shares[1][1]).decode('ascii')}"
+                    # only set if not already provided
+                    os.environ.setdefault("ADMIN_SHARE", a_spec)
+                    os.environ.setdefault("TALLIER_SHARE", t_spec)
+                    admin_share_spec = os.environ.get("ADMIN_SHARE")
+                    tallier_share_spec = os.environ.get("TALLIER_SHARE")
+                    if admin_share_spec and tallier_share_spec:
+                        print("Derived ADMIN_SHARE and TALLIER_SHARE from ELECTION_PRIV_KEY.")
+                    else:
+                        print("error splitting election priv keys")
+                except Exception as e:
+                    print("Failed to split election private key into shares:", e)
             with storage_lock:
                 send_json(self, {"ballots": ballots})
             return
@@ -225,8 +189,9 @@ class reqHandler(BaseHTTPRequestHandler):
         # Fallback: not found
         send_text(self, "404 Not Found\n", status=404)
 
+    #handles all post requests that comes to the server
     def do_POST(self):
-        # Registration endpoint: add a voter when election is closed (before opening)
+        # Registration endpoint: allows registration only when election is closed
         if self.path == "/register":
             if election.get() != "closed":
                 send_text(self, "registration allowed only while election is closed\n", status=403)
@@ -243,6 +208,7 @@ class reqHandler(BaseHTTPRequestHandler):
             # configured. The signature should be over the raw request body.
             sig_b64 = self.headers.get("X-Signature")
             signer = self.headers.get("X-Signer")
+
             if REGISTRAR_SIGN_PUB and signer == "registrar":
                 if not sig_b64 or verify_ed25519 is None:
                     send_text(self, "registrar signature required\n", status=403)
@@ -256,73 +222,119 @@ class reqHandler(BaseHTTPRequestHandler):
                     send_text(self, "invalid signature format\n", status=403)
                     return
 
-            # Accept either an encrypted hashed voter handle (`enc_voter_hash`),
-            # a pre-hashed `voter_hash`, or a raw `voter_id`. Registrar clients
-            # should send `enc_voter_hash` (encrypted to server) and `enc_name`
-            # when available so no raw identifiers are transmitted.
+            # Accept ecrupted messages
             enc_voter_hash = payload.get("enc_voter_hash")
-            voter_hash = payload.get("voter_hash")
-            raw_voter_id = payload.get("voter_id")
             enc_name = payload.get("enc_name")
-            plain_name = payload.get("name")
+            h_hex = payload.get("h")
 
-            if not enc_voter_hash and not voter_hash and not raw_voter_id:
+            # If client did not supply a Schnorr public key, the server
+            # can generate a short secret and corresponding public key and
+            # return the encrypted secret to the registrar caller.
+            enc_secret = None
+
+            if not enc_voter_hash and not enc_name:
                 send_text(self, "missing voter identifier\n", status=400)
                 return
 
             vhash = None
-            if enc_voter_hash:
-                # Decrypt encrypted hashed id using server private key
-                if rsa_decrypt_from_b64 is None or not SERVER_PRIV:
-                    send_text(self, "server decryption unavailable\n", status=500)
-                    return
-                try:
-                    plain = rsa_decrypt_from_b64(SERVER_PRIV, enc_voter_hash)
-                    vhash = plain.decode("utf-8")
-                except Exception:
-                    send_text(self, "failed to decrypt voter identifier\n", status=400)
-                    return
-            elif voter_hash:
-                vhash = voter_hash
-            else:
-                # Validate and hash raw voter id
-                if not _ID_PATTERN.match(str(raw_voter_id)):
-                    send_text(self, "invalid voter_id format\n", status=400)
-                    return
-                vhash = hash_id(raw_voter_id) if hash_id is not None else raw_voter_id
-
-            # If a student_db is configured, require that the hashed id is listed
-            if student_db and vhash not in student_db:
-                send_text(self, "student details not recognised\n", status=403)
+            # Decrypt encrypted hashed id using server private key
+            if rsa_decrypt_from_b64 is None or not SERVER_PRIV:
+                send_text(self, "server decryption unavailable\n", status=500)
                 return
+            try:
+                plain = rsa_decrypt_from_b64(SERVER_PRIV, enc_voter_hash)
+                vhash = plain.decode("utf-8")
+            except Exception:
+                send_text(self, "failed to decrypt voter identifier\n", status=400)
+                return
+                
 
-            # Determine how the name is provided: prefer `enc_name` (already
-            # encrypted by the Registrar), else accept plaintext `name` and
-            # encrypt it for the Registrar if configured.
-            if enc_name:
-                stored_name = enc_name
-            elif plain_name:
-                if encrypt_for_registrar is not None and REGISTRAR_ENC_PUB:
-                    try:
-                        stored_name = encrypt_for_registrar(REGISTRAR_ENC_PUB, plain_name.encode("utf-8"))
-                    except Exception:
-                        stored_name = plain_name
-                else:
-                    stored_name = plain_name
-            else:
-                stored_name = ""
-
-            with storage_lock:
-                if vhash in voters:
-                    send_text(self, "voter already registered\n", status=409)
+            # checking if the voter is a valid student by checking the student_db using the hashed id
+            if student_db:
+                if vhash not in student_db:
+                    send_text(self, "student details not recognised\n", status=403)
                     return
-                voters[vhash] = stored_name
+                
+                stored_name = enc_name
 
-            # Return non-sensitive confirmation (we do not echo raw voter_id)
-            send_json(self, {"voter_hash": vhash, "name_encrypted": bool(REGISTRAR_ENC_PUB)}, status=201)
-            return
+                # If Schnorr params are configured and no `h` provided,
+                # generate a short secret and compute the public key `h`.
+                # Diagnostic: show current environment and headers affecting Schnorr secret generation
+                sch_group = None
+                try:
+                    if not h_hex:
+                        p = os.environ.get("SCHNORR_P")
+                        q = os.environ.get("SCHNORR_Q")
+                        g = os.environ.get("SCHNORR_G")
+                        # If SCHNORR params absent but we can encrypt to the registrar,
+                        # generate a temporary group for testing so we can produce
+                        # a short secret and return it to the registrar. In
+                        # production, distribute stable group parameters to clients.
+                        if not (p and q and g) and REGISTRAR_ENC_PUB:
+                            try:
+                                grp = generate_group(bit_length=256)
+                            except Exception as e:
+                                print("DBG: generate_group failed, falling back to small test group:", e, flush=True)
+                                grp = {'p': 23, 'q': 11, 'g': 2}
+                            p_i = int(grp['p']); q_i = int(grp['q']); g_i = int(grp['g'])
+                        elif p and q and g and REGISTRAR_ENC_PUB:
+                            p_i = int(p); q_i = int(q); g_i = int(g)
+                        else:
+                            p_i = q_i = g_i = None
 
-        # Configure options (allowed only while election is closed)
+                        if p_i and q_i and g_i:
+                            x = voter_secret_key()
+                            print(f"DBG: generated short secret x={x}", flush=True)
+                            h_val = voter_public_key(x, p_i, g_i)
+                            h_hex = hex(h_val)
+                            try:
+                                enc_secret = rsa_encrypt_to_b64(REGISTRAR_ENC_PUB, str(x).encode('utf-8'))
+                                print("DBG: rsa_encrypt_to_b64 succeeded", flush=True)
+                            except Exception as e:
+                                print("DBG: rsa_encrypt_to_b64 failed:", e, flush=True)
+                                try:
+                                    enc_secret = encrypt_for_registrar(REGISTRAR_ENC_PUB, str(x).encode("utf-8"))
+                                    print("DBG: encrypt_for_registrar succeeded", flush=True)
+                                except Exception as e2:
+                                    print("DBG: encrypt_for_registrar failed:", e2, flush=True)
+                                    enc_secret = None
+                            # publish public group params so registrar/client can use them
+                            try:
+                                sch_group = {"p": str(p_i), "q": str(q_i), "g": str(g_i)}
+                            except Exception:
+                                sch_group = None
+                except Exception as e:
+                    # If generation fails, continue without Schnorr support
+                    print("DBG: schnorr generation exception:", e, flush=True)
+                    h_hex = h_hex
+
+                # prevent duplicate registrations
+                with storage_lock:
+                    if vhash in voters:
+                        send_text(self, "voter already registered\n", status=409)
+                        return
+                    # store as dict with enc_name and optional schnorr public key
+                    entry = {"enc_name": stored_name}
+                    if h_hex:
+                        entry["h"] = h_hex
+                    voters[vhash] = entry
+                # Return non-sensitive confirmation (we do not echo raw voter_id)
+                # Include any optional values (encrypted secret for registrar,
+                # and public Schnorr group params) so the registrar/client can
+                # use them.
+                resp_obj = {"res_mes": "Registration complete"}
+                if enc_secret and signer == "registrar":
+                    resp_obj["enc_secret"] = enc_secret
+                if sch_group is not None:
+                    resp_obj["sch_group"] = sch_group
+                send_json(self, resp_obj, status=201)
+                return
+            else:
+                send_text(self, "database error \n", status=503)
+           
+
+
+        # Options endpoint: allows voters to see the list of options to be voted from, options can be viewed befroe the election opens.
         if self.path == "/options":
             if election.get() != "closed":
                 send_text(self, "options may only be set while election is closed\n", status=403)
@@ -348,7 +360,7 @@ class reqHandler(BaseHTTPRequestHandler):
             send_json(self, {"options": options}, status=201)
             return
 
-        # Submit a ballot: allowed only when election is open
+        # Submitting ballot endpoint: allowed only when election is open
         if self.path == "/vote":
             if election.get() != "open":
                 send_text(self, "election is not open for voting\n", status=403)
@@ -360,10 +372,8 @@ class reqHandler(BaseHTTPRequestHandler):
             except Exception:
                 send_text(self, "invalid JSON\n", status=400)
                 return
-
-            # Support encrypted ballots: client should send `enc_voter_hash`
-            # (RSA-OAEP encrypted hashed id to server) and `encrypted_ballot`
-            # (hybrid AES-GCM + RSA-OAEP ciphertext encrypted to election pub).
+            
+            #client encrypted ballot and encrypted voters hash retrieval
             enc_ballot = payload.get("encrypted_ballot")
             enc_voter_hash = payload.get("enc_voter_hash")
 
@@ -371,6 +381,7 @@ class reqHandler(BaseHTTPRequestHandler):
                 if not enc_voter_hash:
                     send_text(self, "missing enc_voter_hash for encrypted ballot\n", status=400)
                     return
+                #server private key will be needed to decrypted the encrypted voters hash 
                 if rsa_decrypt_from_b64 is None or not SERVER_PRIV:
                     send_text(self, "server decryption unavailable\n", status=500)
                     return
@@ -380,10 +391,48 @@ class reqHandler(BaseHTTPRequestHandler):
                     send_text(self, "failed to decrypt voter identifier\n", status=400)
                     return
 
+                #check if voter exists in the registered voters list
                 with storage_lock:
                     if vhash not in voters:
                         send_text(self, "Student not registered, speak to the Registrar,\n", status=403)
                         return
+                    # if Schnorr public key stored, require proof
+                    stored = voters.get(vhash)
+                    stored_h_hex = None
+                    if isinstance(stored, dict):
+                        stored_h_hex = stored.get("h")
+
+                    if stored_h_hex:
+                        pr = payload.get("proof")
+                        if not pr:
+                            send_text(self, "proof required\n", status=400)
+                            return
+                        try:
+                            t, c, s, h_client = deserialize_proof(pr.get("t"), pr.get("c"), pr.get("s"), pr.get("h"))
+                        except Exception:
+                            send_text(self, "invalid proof format\n", status=400)
+                            return
+                        try:
+                            stored_h_val = int(stored_h_hex, 16) if isinstance(stored_h_hex, str) else int(stored_h_hex)
+                        except Exception:
+                            send_text(self, "server stored key invalid\n", status=500)
+                            return
+                        # verify h in proof matches stored h
+                        if h_client != stored_h_val:
+                            send_text(self, "proof public key mismatch\n", status=403)
+                            return
+                        # load group params
+                        try:
+                            p = int(os.environ.get("SCHNORR_P"))
+                            q = int(os.environ.get("SCHNORR_Q"))
+                            g = int(os.environ.get("SCHNORR_G"))
+                        except Exception:
+                            send_text(self, "Schnorr group not configured\n", status=500)
+                            return
+                        ok = voter_verify_proof(stored_h_val, t, c, s, p, q, g, message=vhash.encode("utf-8"))
+                        if not ok:
+                            send_text(self, "invalid proof\n", status=403)
+                            return
                     # prevent double-voting by hashed id
                     if any(b.get("voter_hash") == vhash for b in ballots):
                         send_text(self, "You already voted, you are allowed to vote once for fairness\n", status=409)
@@ -394,54 +443,17 @@ class reqHandler(BaseHTTPRequestHandler):
 
                 send_text(self, "Ballot accepted\n", status=201)
                 return
+            else:
+                send_text(self, "Ballot not found\n", status=403)
 
-            # Fallback: older/plain behaviour -- accept clear ballots and
-            # still use hashed voter lookup if possible.
-            voter_id = payload.get("voter_id")
-            choice = payload.get("choice")
-            if not voter_id or choice is None:
-                send_text(self, "missing voter_id or choice\n", status=400)
-                return
 
-            # Validate ID format on votes as well
-            if not _ID_PATTERN.match(str(voter_id)):
-                send_text(self, "invalid voter_id format\n", status=400)
-                return
-
-            vhash = hash_id(voter_id) if hash_id is not None else voter_id
-
-            with storage_lock:
-                if vhash not in voters:
-                    send_text(self, "Student not registered, speak to the Registrar,\n", status=403)
-                    return
-                if any(b.get("voter_hash") == vhash for b in ballots):
-                    send_text(self, "You already voted, you are allowed to vote once for fairness\n", status=409)
-                    return
-                if choice not in options:
-                    send_text(self, "invalid choice\n", status=400)
-                    return
-
-                # store as encrypted=False legacy ballot (server still stores
-                # voter_hash to avoid raw ids in ballot list)
-                ballots.append({"voter_hash": vhash, "choice": choice})
-
-            send_text(self, "Ballot accepted\n", status=201)
-            return
-
-        # Open voting
+        # Open voting endpoint: allows admin to open election
         if self.path == "/election/open":
             # Verify admin signature if available.
             sig_b64 = self.headers.get("X-Signature")
             signer = self.headers.get("X-Signer")
-            # Optional admin secret check (additional factor). If ADMIN_SECRET
-            # is configured on the server then the client must also send this
-            # secret in the `X-Admin-Secret` header.
-            if ADMIN_SECRET:
-                provided = self.headers.get("X-Admin-Secret")
-                if not provided or provided != ADMIN_SECRET:
-                    send_text(self, "admin secret required\n", status=403)
-                    return
-
+        
+            # making sure it is the admin that is openning the election and no one else
             if ADMIN_SIGN_PUB and signer == "admin":
                 if not sig_b64 or verify_ed25519 is None:
                     send_text(self, "admin signature required\n", status=403)
@@ -454,12 +466,15 @@ class reqHandler(BaseHTTPRequestHandler):
                 except Exception:
                     send_text(self, "invalid signature format\n", status=403)
                     return
-
+            else:
+                send_text(self, "admin signature not found\n", status=403)
+                return
+            
             election.set("open")
             send_text(self, "voting opened\n", status=200)
             return
 
-        # Close voting
+        # Close voting endpoint: allows admin to close election
         if self.path == "/election/close":
             sig_b64 = self.headers.get("X-Signature")
             signer = self.headers.get("X-Signer")
@@ -480,13 +495,8 @@ class reqHandler(BaseHTTPRequestHandler):
             send_text(self, "voting closed\n", status=200)
             return
 
-        # Unknown POST endpoint
+        # I want to reply with a 404 status when the endpoint is not defined
         send_text(self, "404 Not Found\n", status=404)
-
-    def log_message(self, format, *args):
-        # Route logs to stdout in a compact format (same as before).
-        sys.stdout.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), format % args))
-
 
 def run(host="127.0.0.1", port=5000):
     """Start the HTTP server and install a SIGINT handler for clean shutdown."""
